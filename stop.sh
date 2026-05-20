@@ -42,16 +42,16 @@ if [ "$CLEAN" = true ]; then
     read -p "确认删除所有数据？[y/N] " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        $DOCKER_COMPOSE_CMD --profile full down -v --remove-orphans
+        $DOCKER_COMPOSE_CMD --profile full -f docker-compose.prod.yml down -v --remove-orphans
         log_info "所有容器和数据卷已删除"
         rm -rf volumes/ uploads/
         log_info "本地 volumes/ 目录已清理"
     else
-        $DOCKER_COMPOSE_CMD --profile full down --remove-orphans
+        $DOCKER_COMPOSE_CMD --profile full -f docker-compose.prod.yml down --remove-orphans
         log_info "已取消删除数据卷，仅停止容器"
     fi
 else
-    $DOCKER_COMPOSE_CMD --profile full down --remove-orphans
+    $DOCKER_COMPOSE_CMD --profile full -f docker-compose.prod.yml down --remove-orphans
     log_info "所有容器已停止（数据保留）"
 fi
 

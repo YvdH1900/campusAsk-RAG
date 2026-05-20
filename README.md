@@ -39,40 +39,144 @@ CampusAsk-RAG 是一个面向高校校园场景的智能问答系统，通过 RA
 - Python 3.10+（本地开发）
 - Node.js 18+（本地开发）
 
+### 部署架构
+
+```
+公网用户
+    │
+    ▼
+┌──────────────────────┐
+│  Nginx (:80 / :443)  │  ← 唯一对外入口，反向代理
+│  deploy/nginx/       │
+│  nginx.conf          │
+└──────┬───────────────┘
+       │
+       ├─→ 前端静态文件 (frontend/dist/)
+       │   /var/www/campusask-rag
+       │
+       └─→ /api/* → Backend (:8000)
+                        │
+                        └─→ Internal 网络（外部隔离）
+                            MySQL / Redis / RabbitMQ
+                            Milvus / MinIO / etcd
+```
+
 ### 方式一：Docker 一键部署（推荐）
 
 ```bash
 # 1. 配置环境变量
 cp .env.example .env
-# 编辑 .env，配置 DASHSCOPE_API_KEY 及各服务密码
+nano .env
+# 必须修改：
+#   DASHSCOPE_API_KEY=sk-xxx     通义千问 API 密钥（必填）
+#   SECRET_KEY=xxx               openssl rand -hex 32 生成
+#   MYSQL_ROOT_PASSWORD=xxx      MySQL root 密码
+#   REDIS_PASSWORD=xxx           Redis 密码
+#   RABBITMQ_PASSWORD=xxx        RabbitMQ 密码
 
-# 2. 一键启动所有服务（MySQL、Redis、Milvus、后端、前端等）
+# 2. 配置 Nginx 域名（将 yourdomain.com 改为你的域名或服务器 IP）
+nano deploy/nginx/nginx.conf
+
+# 3. 一键启动所有服务
 chmod +x start.sh
 ./start.sh
 ```
 
+启动脚本自动执行以下流程：
+1. 检测 Docker 环境
+2. 检查并初始化 `.env` 配置文件
+3. 构建前端 → 构建后端镜像 → 启动所有容器
+4. 依次等待 MySQL、Redis、RabbitMQ、Milvus、Nginx 健康检查通过
+5. 显示访问地址
+
+**启动的服务清单：**
+
+| 服务 | 容器名 | 对外端口 | 说明 |
+|------|--------|---------|------|
+| Nginx | campusask-nginx | **80 / 443** | 唯一对外入口，反向代理 |
+| Backend | campusask-backend | 无 | FastAPI 后端 |
+| Celery | campusask-celery | 无 | 异步任务 Worker |
+| MySQL | campusask-mysql | 无 | 关系数据库 |
+| Redis | campusask-redis | 无 | 缓存 |
+| RabbitMQ | campusask-rabbitmq | 无 | 消息队列 |
+| Milvus | campusask-milvus | 无 | 向量数据库 |
+| MinIO | campusask-minio | 无 | 对象存储 |
+| etcd | campusask-etcd | 无 | Milvus 依赖 |
+
 启动完成后访问：
-- **前端**：http://localhost
-- **API 文档**：http://localhost:8000/docs
-- **健康检查**：http://localhost:8000/health
+- **前端页面**：http://服务器IP
+- **API 健康检查**：http://服务器IP/api/health
+
+> ⚠️ **安全说明**：生产环境仅暴露 80/443 端口（Nginx），
+> 所有数据库和中间件端口（3306/6379/19530/5672/9001 等）均隐藏在内网，
+> 外部无法直接访问。
+
+### 配置 HTTPS（可选，推荐生产环境开启）
+
+HTTPS 不是必须的。首次部署直接通过 HTTP 即可访问，需要 HTTPS 时再按以下步骤配置。
+
+由于 Nginx 运行在 Docker 容器内，需要使用 certbot 的 standalone 模式获取证书：
+
+```bash
+# 1. 安装 certbot
+apt install certbot -y
+
+# 2. 先确保 80 端口未被占用（临时停止 Docker Nginx）
+docker stop campusask-nginx 2>/dev/null || true
+
+# 3. 申请 SSL 证书（替换为你的域名）
+certbot certonly --standalone -d yourdomain.com
+
+# 4. 将证书复制到 Nginx 配置目录
+cp -r /etc/letsencrypt/live/yourdomain.com deploy/nginx/ssl/
+
+# 5. 修改 Nginx 配置启用 HTTPS
+nano deploy/nginx/nginx.conf
+# - 取消 HTTPS server 段的注释
+# - 取消 HTTP server 中 return 301 的注释
+# - 将 yourdomain.com 替换为你的域名
+
+# 6. 重启 Nginx 容器
+docker start campusask-nginx
+```
+
+> ✅ 证书有效期 90 天，建议设置自动续期：
+> ```bash
+> crontab -e
+> # 添加：0 0 1 * * certbot renew --standalone --pre-hook "docker stop campusask-nginx" --post-hook "docker start campusask-nginx"
+> ```
 
 ### 方式二：本地开发
 
 ```bash
-# 1. 启动基础服务（MySQL、Redis、RabbitMQ）
+# 1. 启动基础服务（MySQL、Redis、RabbitMQ、Milvus）
 docker compose -f docker-compose.services.yml up -d
 
-# 2. 配置后端环境变量
+# 2. 启动 Milvus 向量数据库（需单独启动）
+# 方式 A：使用 Docker 命令直接启动
+docker run -d --name campusask-milvus \
+  -p 19530:19530 -p 9091:9091 \
+  -e ETCD_ENDPOINTS=host.docker.internal:2379 \
+  -e MINIO_ADDRESS=host.docker.internal:9000 \
+  milvusdb/milvus:v2.4.0 milvus run standalone
+
+# 方式 B：使用完整编排文件启动所有依赖
+# docker compose -f docker-compose.full.yml up -d etcd minio milvus
+
+# 3. 配置后端环境变量
 cp backend/.env.example backend/.env
 # 编辑 backend/.env，配置 DASHSCOPE_API_KEY
 
-# 3. 启动后端
+# 4. 启动后端
 cd backend && pip install -r requirements.txt
 python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
-# 4. 启动前端
+# 5. 启动前端
 cd frontend && npm install && npm run dev
 ```
+
+> 💡 `docker-compose.full.yml` 包含所有服务的完整编排（含 Milvus/etcd/MinIO），
+> 适合不想单独启动 Milvus 的开发者。
 
 > 💡 **停止服务**：`./stop.sh`（保留数据）或 `./stop.sh --clean`（清除所有数据）
 
@@ -110,9 +214,18 @@ CampusAsk-RAG/
 │   │   ├── stores/            # Pinia 状态管理
 │   │   └── views/             # 页面组件
 │   └── package.json
-├── deploy/                    # 部署配置（Nginx/数据库）
-├── milvus-config/             # Milvus 配置
-└── docker-compose*.yml        # Docker 编排
+├── deploy/                    # 部署配置
+│   ├── nginx/
+│   │   ├── nginx.conf         # Nginx 反向代理配置（唯一对外入口）
+│   │   └── ssl/               # SSL 证书目录（.gitkeep）
+│   ├── init_database.sql      # 数据库初始化脚本
+│   └── firewall/              # 防火墙规则
+├── milvus-config/             # Milvus 向量库配置
+├── start.sh                   # 一键启动脚本（生产环境）
+├── stop.sh                    # 一键停止脚本
+├── docker-compose.full.yml    # 全服务编排（含 Milvus，开发用）
+├── docker-compose.prod.yml    # 生产环境编排（网络隔离 + Nginx）
+├── docker-compose.services.yml # 基础服务编排（MySQL/Redis/RabbitMQ）
 ```
 
 ---

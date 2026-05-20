@@ -103,5 +103,8 @@ minio_data/
 celerybeat-schedule.*
 celerybeat.pid
 
-# Nginx 运行时数据
+# Nginx 运行时数据（保留 deploy/nginx/ 部署配置）
 nginx/
+!deploy/nginx/
+deploy/nginx/ssl/*
+!deploy/nginx/ssl/.gitkeep

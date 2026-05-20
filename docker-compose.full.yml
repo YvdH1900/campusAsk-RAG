@@ -1,5 +1,14 @@
+# ================================================
+# CampusAsk-RAG 全服务编排（开发环境用）
+# ================================================
+# 此文件包含所有服务的完整编排（含 Milvus/etcd/MinIO），
+# 端口全部暴露到宿主机，适合本地开发调试。
+# 
+# ⚠️ 生产环境请使用 docker-compose.prod.yml（网络隔离 + Nginx）
+# ================================================
+
 services:
-  # ==================== 生产环境：MySQL 数据库 ====================
+  # ==================== MySQL 数据库 ====================
   mysql:
     profiles: [full]
     container_name: campusask-mysql
@@ -16,13 +25,13 @@ services:
       - ./deploy/init_database.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      start_period: 180s  # 给3分钟初始化时间
+      start_period: 180s
       interval: 30s
       timeout: 30s
       retries: 10
     restart: unless-stopped
 
-  # ==================== 生产环境：Redis 服务 ====================
+  # ==================== Redis 服务 ====================
   redis:
     profiles: [full]
     container_name: campusask-redis
@@ -38,7 +47,7 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # ==================== 生产环境：RabbitMQ 服务 ====================
+  # ==================== RabbitMQ 服务 ====================
   rabbitmq:
     profiles: [full]
     container_name: campusask-rabbitmq
@@ -59,7 +68,7 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # ==================== 生产环境：FastAPI 后端 ====================
+  # ==================== FastAPI 后端 ====================
   backend:
     profiles: [full]
     build:
@@ -92,7 +101,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  # ==================== 生产环境：Celery 异步任务 Worker ====================
+  # ==================== Celery 异步任务 Worker ====================
   celery-worker:
     profiles: [full]
     build:

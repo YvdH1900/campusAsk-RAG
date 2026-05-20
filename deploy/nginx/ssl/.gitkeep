@@ -1,0 +1,6 @@
+# 此目录存放 SSL 证书文件（不上传 Git）
+# 使用 certbot 生成证书后，证书文件会自动存放于此：
+#   - fullchain.pem
+#   - privkey.pem
+# 
+# 生成方式：certbot --nginx -d yourdomain.com
