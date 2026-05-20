@@ -1,54 +1,107 @@
-# Dependencies
+# ================================================
+# CampusAsk-RAG .gitignore
+# 防止敏感信息和开发数据泄露到版本控制
+# ================================================
+
+# 环境变量和密钥文件（包含数据库密码、API Key 等）
+.env
+.env.*
+!.env.example
+.env.local
+.env.production
+.env.*.local
+.secrets
+credentials.json
+*.key
+*.pem
+*.crt
+
+# Python 依赖和虚拟环境
 node_modules/
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
-pip-log.txt
-pip-delete-this-directory.txt
+*.egg-info/
+*.egg
 
-# Environment
-.env
-.env.local
-.env.*.local
-
-# IDE
+# IDE 配置
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
+*.sublime-*
 
-# Build outputs
+# 构建输出
 dist/
 build/
-*.egg-info/
 *.egg
+*.egg-info/
+dist/
+build/
 
-# OS
+# 操作系统文件
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# Logs
+# 日志文件
 *.log
 logs/
 
-# Testing
+# 测试覆盖率
 .coverage
 htmlcov/
 .pytest_cache/
 
-# Database
+# 数据库文件
 *.db
 *.sqlite
 *.sqlite3
 
-# Uploads
+# 上传和临时文件
 uploads/
 temp/
+tmp/
 
-# Docker
+# Docker 运行时数据
+volumes/
 docker-compose.override.yml
+
+# Milvus 向量数据库数据
+milvus_data/
+milvus/
+
+# MySQL 数据
+mysql_data/
+
+# Redis 数据
+redis_data/
+
+# RabbitMQ 数据
+rabbitmq_data/
+
+# MinIO 数据
+minio_data/
+
+# 备份文件
+*.bak
+*.backup
+*.old
+*~
+
+# 安全扫描产物
+.bandit
+.mypy_cache/
+.ruff_cache/
+
+# Celery 运行时文件
+celerybeat-schedule.*
+celerybeat.pid
+
+# Nginx 运行时数据
+nginx/

@@ -1,0 +1,8 @@
+# Milvus 自定义配置
+
+dataCoord:
+  compaction:
+    gc:
+      # GC 间隔（秒），默认 3600 秒（1 小时）
+      # 调整为 600 秒（10 分钟）
+      interval: 600

@@ -1,0 +1,307 @@
+# ================================================
+# CampusAsk-RAG Docker 生产环境网络隔离配置
+# ================================================
+# 说明：
+# 1. 此配置使用 Docker 内部网络，不暴露任何数据库端口到宿主机
+# 2. 只通过 Nginx 反向代理暴露 80/443 端口
+# 3. 所有内部服务通过 Docker 网络通信
+# ================================================
+
+version: '3.8'
+
+# 定义网络
+networks:
+  # 外部网络：只有 Nginx 和前端可以访问
+  web:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+  
+  # 内部网络：后端、数据库、中间件（外部无法访问）
+  internal:
+    driver: bridge
+    internal: true  # 🔒 关键：内部网络，无外部访问
+    ipam:
+      config:
+        - subnet: 172.29.0.0/16
+
+services:
+  # ==================== 前端构建服务 ====================
+  frontend-builder:
+    profiles: [full]
+    image: node:18-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: sh -c "npm install && npm run build"
+    networks:
+      - web
+    restart: "no"
+
+  # ==================== Nginx 反向代理（唯一对外入口） ====================
+  nginx:
+    profiles: [full]
+    image: nginx:alpine
+    container_name: campusask-nginx
+    ports:
+      - "80:80"    # HTTP
+      - "443:443"  # HTTPS
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend/dist:/var/www/campusask-rag:ro
+      - ./deploy/nginx/ssl:/etc/letsencrypt:ro
+    depends_on:
+      - backend
+    networks:
+      - web  # 外部网络
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==================== 后端服务 ====================
+  backend:
+    profiles: [full]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
+    container_name: campusask-backend
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+      - ./uploads:/app/uploads
+    environment:
+      DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-root}@mysql:3306/campus_ask_rag?charset=utf8mb4
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      MILVUS_HOST: milvus
+      MILVUS_PORT: 19530
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}
+      SECRET_KEY: ${SECRET_KEY}
+      ENABLE_API_DOCS: ${ENABLE_API_DOCS:-false}  # 🔒 生产环境默认禁用
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    networks:
+      - web      # 与 Nginx 通信
+      - internal # 与数据库通信
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==================== Celery Worker ====================
+  celery-worker:
+    profiles: [full]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: campusask-celery
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+      - ./uploads:/app/uploads
+    environment:
+      DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-root}@mysql:3306/campus_ask_rag?charset=utf8mb4
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      MILVUS_HOST: milvus
+      MILVUS_PORT: 19530
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY}
+    depends_on:
+      - mysql
+      - redis
+      - rabbitmq
+      - milvus
+    command: celery -A app.core.celery:celery_app worker --loglevel=info -P solo
+    networks:
+      - internal  # 只需要内部网络
+    restart: unless-stopped
+
+  # ==================== MySQL 数据库（内部网络） ====================
+  mysql:
+    profiles: [full]
+    image: mysql:8.0
+    container_name: campusask-mysql
+    # 🔒 关键：不暴露端口到宿主机！
+    # ports:
+    #   - "3306:3306"  # ❌ 注释掉
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root}
+      MYSQL_DATABASE: campus_ask_rag
+      MYSQL_CHARSET: utf8mb4
+      MYSQL_COLLATION: utf8mb4_unicode_ci
+    volumes:
+      - ./volumes/mysql:/var/lib/mysql
+      - ./deploy/init_database.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - internal  # 🔒 只在内部网络
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== Redis 缓存（内部网络） ====================
+  redis:
+    profiles: [full]
+    image: redis:7-alpine
+    container_name: campusask-redis
+    # 🔒 关键：不暴露端口到宿主机！
+    # ports:
+    #   - "6379:6379"  # ❌ 注释掉
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis}
+    volumes:
+      - ./volumes/redis:/data
+    networks:
+      - internal  # 🔒 只在内部网络
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==================== RabbitMQ 消息队列（内部网络） ====================
+  rabbitmq:
+    profiles: [full]
+    image: rabbitmq:3-management-alpine
+    container_name: campusask-rabbitmq
+    # 🔒 关键：不暴露端口到宿主机！
+    # ports:
+    #   - "5672:5672"
+    #   - "15672:15672"  # ❌ 注释掉
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - ./volumes/rabbitmq:/var/lib/rabbitmq
+    networks:
+      - internal  # 🔒 只在内部网络
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ==================== Milvus 向量数据库（内部网络） ====================
+  milvus:
+    profiles: [full]
+    image: milvusdb/milvus:v2.3.0
+    container_name: campusask-milvus
+    # 🔒 关键：不暴露端口到宿主机！
+    # ports:
+    #   - "19530:19530"  # ❌ 注释掉
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_USER:-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_PASSWORD:-minioadmin}
+    volumes:
+      - ./volumes/milvus:/var/lib/milvus
+    depends_on:
+      - etcd
+      - minio
+    networks:
+      - internal  # 🔒 只在内部网络
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==================== MinIO 对象存储（内部网络） ====================
+  minio:
+    profiles: [full]
+    image: minio/minio
+    container_name: campusask-minio
+    # 🔒 关键：不暴露端口到宿主机！
+    # ports:
+    #   - "9000:9000"
+    #   - "9001:9001"  # ❌ 注释掉
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD:-minioadmin}
+    volumes:
+      - ./volumes/minio:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - internal  # 🔒 只在内部网络
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ==================== etcd（Milvus 依赖，内部网络） ====================
+  etcd:
+    profiles: [full]
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: campusask-etcd
+    # 🔒 关键：不暴露端口
+    # ports:
+    #   - "2379:2379"  # ❌ 注释掉
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+    volumes:
+      - ./volumes/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    networks:
+      - internal  # 🔒 只在内部网络
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# ================================================
+# 使用说明
+# ================================================
+#
+# 1. 启动所有服务（生产环境）：
+#    docker-compose --profile full up -d
+#
+# 2. 查看服务状态：
+#    docker-compose ps
+#
+# 3. 查看日志：
+#    docker-compose logs -f nginx
+#    docker-compose logs -f backend
+#
+# 4. 停止所有服务：
+#    docker-compose --profile full down
+#
+# 5. 验证网络隔离：
+#    # 在宿主机执行
+#    netstat -tlnp | grep -E '3306|6379|19530|9000|9001'
+#    # 应该看不到任何端口（因为都在 Docker 内部网络）
+#
+# 6. 访问服务：
+#    - 前端：http://localhost 或 https://yourdomain.com
+#    - API:  http://localhost/api 或 https://yourdomain.com/api
+#    - 数据库端口全部无法访问 ✅
+#
+# ================================================
