@@ -39,28 +39,42 @@ CampusAsk-RAG 是一个面向高校校园场景的智能问答系统，通过 RA
 - Python 3.10+（本地开发）
 - Node.js 18+（本地开发）
 
-### 一键启动
+### 方式一：Docker 一键部署（推荐）
 
 ```bash
-# 1. 配置环境变量（Docker Compose 密码等）
+# 1. 配置环境变量
+cp .env.example .env
+# 编辑 .env，配置 DASHSCOPE_API_KEY 及各服务密码
+
+# 2. 一键启动所有服务（MySQL、Redis、Milvus、后端、前端等）
+chmod +x start.sh
+./start.sh
+```
+
+启动完成后访问：
+- **前端**：http://localhost
+- **API 文档**：http://localhost:8000/docs
+- **健康检查**：http://localhost:8000/health
+
+### 方式二：本地开发
+
+```bash
+# 1. 启动基础服务（MySQL、Redis、RabbitMQ）
+docker compose -f docker-compose.services.yml up -d
+
+# 2. 配置后端环境变量
 cp backend/.env.example backend/.env
-# 编辑 backend/.env，配置 DASHSCOPE_API_KEY 及各服务密码
+# 编辑 backend/.env，配置 DASHSCOPE_API_KEY
 
-# 2. 启动基础设施
-docker-compose -f docker-compose.services.yml up -d
+# 3. 启动后端
+cd backend && pip install -r requirements.txt
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
-# 3. 初始化数据库
-docker exec -i mysql mysql -uroot -p<YOUR_MYSQL_PASSWORD> campus_ask_rag < deploy/init_database.sql
-
-# 4. 启动后端
-cd backend && python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-
-# 5. 启动前端
+# 4. 启动前端
 cd frontend && npm install && npm run dev
 ```
 
-> 💡 **Docker 全栈部署**：使用 `docker-compose up -d` 一键启动所有服务。  
-> Docker Compose 会从根目录 `.env` 读取密码等变量（`cp .env.example .env` 后编辑）。
+> 💡 **停止服务**：`./stop.sh`（保留数据）或 `./stop.sh --clean`（清除所有数据）
 
 ### 默认账号
 
@@ -131,6 +145,7 @@ CampusAsk-RAG/
 - `GET/POST/PUT /api/v1/admin/model-configs` - 模型配置
 
 ---
+
 
 ## 详细文档
 

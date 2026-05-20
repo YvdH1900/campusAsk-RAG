@@ -438,7 +438,7 @@ Write-Host "|  API Docs:   http://localhost:8000/docs   |" -ForegroundColor $B
 Write-Host "|  RabbitMQ:   http://localhost:15672       |" -ForegroundColor $B
 Write-Host "|  MinIO:      http://localhost:9001        |" -ForegroundColor $B
 Write-Host "|                                           |" -ForegroundColor $B
-Write-Host "|  Admin:      admin（密码请查看环境变量）   |" -ForegroundColor $B
+Write-Host "|  Admin:      admin                        |" -ForegroundColor $B
 Write-Host "|                                           |" -ForegroundColor $B
 Write-Host "+===========================================+" -ForegroundColor $B
 Write-Host ""

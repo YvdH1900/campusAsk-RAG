@@ -16,9 +16,10 @@ services:
       - ./deploy/init_database.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      start_period: 180s  # 给3分钟初始化时间
+      interval: 30s
+      timeout: 30s
+      retries: 10
     restart: unless-stopped
 
   # ==================== 生产环境：Redis 服务 ====================
