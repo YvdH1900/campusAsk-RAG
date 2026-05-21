@@ -82,25 +82,7 @@ class EmbeddingService:
         text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()
         return f"embedding:{model_name}:{text_hash}"
 
-    def _get_current_dimension(self, db=None) -> int | None:
-        """
-        获取当前 Embedding 模型的向量维度
-        从数据库 ModelConfig.dimension 读取
-        """
-        if db:
-            try:
-                from app.models import ModelConfig
-                active = db.query(ModelConfig).filter(
-                    ModelConfig.model_type == "embedding",
-                    ModelConfig.is_active == True
-                ).first()
-                if active and active.dimension:
-                    return active.dimension
-            except Exception as e:
-                logger.warning(f"读取向量维度失败: {e}")
-        return None
-
-    def _call_with_retry(self, texts, model_name, is_batch=False, dimension=None):
+    def _call_with_retry(self, texts, model_name, is_batch=False):
         """
         带指数退避重试的 API 调用
         
@@ -116,10 +98,10 @@ class EmbeddingService:
         
         for attempt in range(self.max_retries):
             try:
-                kwargs = {"model": model_name, "input": texts}
-                if dimension:
-                    kwargs["dimensions"] = dimension
-                response = TextEmbedding.call(**kwargs)
+                response = TextEmbedding.call(
+                    model=model_name,
+                    input=texts,
+                )
 
                 if response.status_code == 200:
                     return response
@@ -155,9 +137,8 @@ class EmbeddingService:
         if not text or not text.strip():
             return []
 
-        # 获取当前模型名称和维度
+        # 获取当前模型名称
         model_name = self._get_current_model_name(db)
-        dimension = self._get_current_dimension(db)
 
         # 尝试从缓存获取
         cache_key = self._get_cache_key(text, model_name)
@@ -166,7 +147,7 @@ class EmbeddingService:
             return cached
 
         # 调用 API（带重试）
-        response = self._call_with_retry(text, model_name=model_name, is_batch=False, dimension=dimension)
+        response = self._call_with_retry(text, model_name=model_name, is_batch=False)
 
         embedding = response.output["embeddings"][0]["embedding"]
         # 写入缓存
@@ -185,9 +166,8 @@ class EmbeddingService:
         Returns:
             向量列表的列表
         """
-        # 获取当前模型名称和维度
+        # 获取当前模型名称
         model_name = self._get_current_model_name(db)
-        dimension = self._get_current_dimension(db)
         
         # 过滤空文本并记录原始索引
         valid_texts = []
@@ -225,7 +205,7 @@ class EmbeddingService:
             # 2. 调用 API 获取未缓存的文本（带重试）
             new_embeddings = []
             if uncached_texts:
-                response = self._call_with_retry(uncached_texts, model_name=model_name, is_batch=True, dimension=dimension)
+                response = self._call_with_retry(uncached_texts, model_name=model_name, is_batch=True)
 
                 # 验证 API 返回的向量数量
                 api_embeddings = response.output.get("embeddings", [])
