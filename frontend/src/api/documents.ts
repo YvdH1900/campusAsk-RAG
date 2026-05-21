@@ -42,7 +42,7 @@ export function reviewDocument(documentId: number, data: { action: string; reaso
 
 export async function downloadDocument(documentId: number) {
   const token = sessionStorage.getItem('token')
-  const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+  const baseURL = import.meta.env.VITE_API_BASE_URL || ''
   
   try {
     // 使用 fetch 下载，支持 Header 认证

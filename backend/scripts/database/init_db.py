@@ -9,7 +9,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from app.core.database import engine, SessionLocal
-from app.models import Base, User, UserRole
+from app.models import Base, User, UserRole, QuestionStat
 from app.core.security import get_password_hash
 from app.core.logging_config import get_logger
 

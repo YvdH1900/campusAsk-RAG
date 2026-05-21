@@ -60,7 +60,7 @@ export const chatApi = {
 
   askStream: (data: ChatAskRequest, onChunk: (chunk: string) => void, onDone: (data: any) => void, onError: (error: string) => void, onVerification?: (data: any) => void) => {
     const token = sessionStorage.getItem('token')
-    const baseURL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+    const baseURL = import.meta.env.VITE_API_BASE_URL || ''
     
     fetch(`${baseURL}/api/v1/chat/ask/stream`, {
       method: 'POST',

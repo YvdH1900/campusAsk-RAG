@@ -69,6 +69,8 @@ async def lifespan(app: FastAPI):
     
     _check_database_connection()
     
+    _ensure_tables_exist()
+    
     _create_default_admin_if_not_exists()
     
     _sync_model_config_from_db()
@@ -113,6 +115,22 @@ def _check_database_connection():
     except Exception as e:
         logger.warning(f"⚠️ 数据库连接失败（将以降级模式启动）: {str(e)}")
         logger.warning("💡 提示：请检查 MySQL 服务是否运行，以及 .env 中的 DATABASE_URL 配置是否正确")
+
+
+def _ensure_tables_exist():
+    """
+    确保所有数据库表已创建
+    导入所有模型后调用 create_all，避免遗漏新表
+    """
+    try:
+        from app.core.database import engine
+        from app.models import Base  # 导入 Base 会触发所有模型注册
+        
+        Base.metadata.create_all(bind=engine)
+        logger.info("✅ 数据库表检查完成")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ 数据库表创建失败（可能已存在）: {str(e)}")
 
 
 def _create_default_admin_if_not_exists():
@@ -261,6 +279,7 @@ app.include_router(chat_router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["系统"])
+@app.get("/api/health", tags=["系统"], include_in_schema=False)
 async def health_check():
     """
     健康检查接口
