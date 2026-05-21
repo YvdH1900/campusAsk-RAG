@@ -29,11 +29,13 @@ CREATE TABLE users (
     pending_approval BOOLEAN NOT NULL DEFAULT FALSE COMMENT '是否待审核（教师注册）',
     approval_status VARCHAR(20) NOT NULL DEFAULT 'approved' COMMENT '审核状态：pending/approved/rejected',
     ban_until DATETIME COMMENT '封禁截止时间',
+    can_modify_profile BOOLEAN NOT NULL DEFAULT TRUE COMMENT '是否允许修改个人信息',
     max_questions_per_day INT NOT NULL DEFAULT 100 COMMENT '每日最大提问次数',
     max_uploads_per_day INT NOT NULL DEFAULT 10 COMMENT '每日最大上传文件次数',
     questions_today INT NOT NULL DEFAULT 0 COMMENT '今日已提问次数',
     uploads_today INT NOT NULL DEFAULT 0 COMMENT '今日已上传次数',
     last_reset_date DATE COMMENT '上次重置计数日期',
+    current_session_id VARCHAR(100) COMMENT '当前登录会话 ID',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     INDEX idx_username (username),
@@ -64,6 +66,9 @@ CREATE TABLE messages (
     role VARCHAR(20) NOT NULL COMMENT '消息角色：user/assistant',
     content TEXT NOT NULL COMMENT '消息内容',
     sources TEXT COMMENT '引用来源 (JSON 格式)',
+    confidence VARCHAR(20) COMMENT '答案置信度: 高/中/低',
+    features TEXT COMMENT '功能状态 (JSON 格式)',
+    token_usage TEXT COMMENT 'Token 使用详情 (JSON 格式)',
     feedback VARCHAR(10) COMMENT '用户反馈：up/down',
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     INDEX idx_session_id (session_id),
@@ -78,6 +83,7 @@ CREATE TABLE documents (
     id INT PRIMARY KEY AUTO_INCREMENT COMMENT '文档 ID',
     filename VARCHAR(255) NOT NULL COMMENT '文件名',
     file_path VARCHAR(500) NOT NULL COMMENT '文件存储路径',
+    file_size INT NOT NULL DEFAULT 0 COMMENT '文件大小 (字节)',
     category VARCHAR(50) COMMENT '文档分类',
     description TEXT COMMENT '文档描述',
     status VARCHAR(20) NOT NULL DEFAULT 'pending' COMMENT '处理状态：pending/processing/completed/failed',
@@ -160,6 +166,19 @@ CREATE TABLE model_configs (
     INDEX idx_model_type (model_type),
     INDEX idx_is_active (is_active)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='模型配置表';
+
+-- ================================================
+-- 9. 问题统计表
+-- ================================================
+CREATE TABLE question_stats (
+    id INT PRIMARY KEY AUTO_INCREMENT COMMENT '统计 ID',
+    content VARCHAR(500) NOT NULL COMMENT '问题内容',
+    count INT NOT NULL DEFAULT 1 COMMENT '提问次数',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '首次提问时间',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间',
+    INDEX idx_question_stats_content (content),
+    INDEX idx_question_stats_count (count)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='问题统计表';
 
 -- ================================================
 -- 插入默认数据
