@@ -60,9 +60,10 @@ services:
       - web  # 外部网络
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "nginx", "-t"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "nginx", "-v"]
+      interval: 15s
+      timeout: 5s
+      start_period: 5s
       retries: 3
 
   # ==================== 后端服务 ====================
