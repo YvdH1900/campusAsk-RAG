@@ -858,7 +858,8 @@ const saveEmbeddingConfig = async () => {
         model_type: 'embedding',
         model_name: embeddingConfig.model_name,
         api_key: embeddingConfig.api_key,
-        api_base_url: embeddingConfig.api_base_url || undefined
+        api_base_url: embeddingConfig.api_base_url || undefined,
+        dimension: embeddingConfig.dimension || undefined
       })
     })
     

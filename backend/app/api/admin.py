@@ -1029,6 +1029,27 @@ def get_rebuild_progress(
     return task.to_dict()
 
 
+def _detect_embedding_dimension(model_name: str, api_key: str) -> int | None:
+    """
+    自动检测 Embedding 模型的输出维度
+    通过调用一次 DashScope API 获取实际向量长度
+    """
+    try:
+        from dashscope import TextEmbedding
+
+        response = TextEmbedding.call(
+            model=model_name,
+            input="test"
+        )
+
+        if response.status_code == 200:
+            embedding = response.output["embeddings"][0]["embedding"]
+            return len(embedding)
+    except Exception as e:
+        logger.warning(f"检测向量维度失败: {e}")
+    return None
+
+
 def rebuild_vector_store(task_id: str, config_id: int, model_name: str, api_key: str, api_base_url: str, db: Session):
     """
     重建向量库（后台任务）
@@ -1057,6 +1078,22 @@ def rebuild_vector_store(task_id: str, config_id: int, model_name: str, api_key:
         
         os.environ["DASHSCOPE_API_KEY"] = api_key
         dashscope.api_key = api_key
+
+        # 确定向量维度：已手动配置 > 自动检测 > 默认值
+        progress_store.update_task(task_id, 5, "确定维度", "正在获取向量维度")
+        target_config = db.query(ModelConfig).filter(ModelConfig.id == config_id).first()
+        resolved_dim = None
+        if target_config and target_config.dimension:
+            resolved_dim = target_config.dimension
+            logger.info(f"使用已配置的向量维度: {resolved_dim}")
+        else:
+            resolved_dim = _detect_embedding_dimension(model_name, api_key)
+            if resolved_dim and target_config:
+                target_config.dimension = resolved_dim
+                db.commit()
+                logger.info(f"自动检测向量维度并保存: {resolved_dim}")
+            elif not resolved_dim:
+                logger.warning("无法自动检测向量维度，将使用默认值")
         
         progress_store.update_task(task_id, 10, "清空向量库", "正在删除现有向量数据")
         
