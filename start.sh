@@ -130,7 +130,25 @@ wait_for_service "campusask-minio" "MinIO" 60 &
 wait_for_service "campusask-mysql" "MySQL" 120 &
 wait_for_service "campusask-redis" "Redis" 60 &
 wait_for_service "campusask-rabbitmq" "RabbitMQ" 60 &
-wait_for_service "campusask-nginx" "Nginx" 60 &
+
+# Nginx 无内置健康检查，通过宿主机直连检测
+wait_for_nginx() {
+    local max_wait=60
+    local waited=0
+    while [ $waited -lt $max_wait ]; do
+        if curl -sf http://localhost:80/ > /dev/null 2>&1; then
+            log_info "Nginx (campusask-nginx) 已就绪"
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+        echo -n "."
+    done
+    echo ""
+    log_error "Nginx (campusask-nginx) 等待超时 (${max_wait}s)"
+    return 1
+}
+wait_for_nginx &
 
 set +e
 wait
