@@ -136,7 +136,8 @@ services:
       - milvus
     command: celery -A app.core.celery:celery_app worker --loglevel=info -P solo
     networks:
-      - internal  # 只需要内部网络
+      - internal  # 与数据库通信
+      - web       # 访问外网（调用 DashScope API）
     restart: unless-stopped
 
   # ==================== MySQL 数据库（内部网络） ====================
