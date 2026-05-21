@@ -705,6 +705,7 @@ def create_model_config(
         model_name=config_data.model_name,
         api_key=config_data.api_key,
         api_base_url=config_data.api_base_url,
+        dimension=config_data.dimension,
         config=config_data.config,
         is_active=False,
         is_default=False
