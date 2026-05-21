@@ -60,10 +60,10 @@ services:
       - web  # 外部网络
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "nginx", "-v"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/ > /dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
-      start_period: 5s
+      start_period: 10s
       retries: 3
 
   # ==================== 后端服务 ====================
