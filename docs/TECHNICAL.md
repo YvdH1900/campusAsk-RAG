@@ -74,7 +74,7 @@
          │
          ▼
 ┌─────────────────┐
-│  10. 答案验证    │ ← 检查事实准确性和上下文覆盖率
+│  10. 答案验证    │ ← 检查事实准确性和上下文覆盖率（默认禁用）
 └────────┬────────┘
          │
          ▼
@@ -146,12 +146,16 @@ combined_score = 0.7 * vector_score + 0.3 * keyword_overlap
 
 **实现文件**：`backend/app/services/answer_verifier.py`
 
-对 LLM 生成的答案进行质量检查：
+**默认状态**：已禁用（`use_answer_verification = False`）
+
+对 LLM 生成的答案进行质量检查（仅在手动开启后生效）：
 
 1. **空答案检测**
 2. **免责声明检测**：检测"我不确定"、"可能"、"也许"等不确定表述
 3. **上下文覆盖率**：计算答案中有多少内容来自检索上下文（最低要求 30%）
-4. **验证失败处理**：触发重新生成或降级策略
+4. **AI 验证**：调用 LLM 判断答案是否基于上下文（可选，稳定性待改善）
+
+> ⚠️ 目前默认关闭，因为 AI 验证依赖 LLM 输出的严格格式解析，实际使用中容易误判；规则验证的中文分词算法也不够精确。未来版本会优化后重新启用。
 
 ---
 
@@ -462,7 +466,7 @@ semantic_cache:{md5(question)}          # 语义缓存
 │  └─────────────────────────────────────────────────┘ │
 │                                                       │
 │  ┌──────────┐                                        │
-│  │  Celery  │ (仅连接 Internal 网络)                  │
+│  │  Celery  │ (连接 Internal + Web 网络)              │
 │  │ Worker   │                                        │
 │  └──────────┘                                        │
 └───────────────────────────────────────────────────────┘
@@ -528,6 +532,6 @@ docker compose logs -f backend
 | Milvus | `curl localhost:9091/healthz` | 30s |
 | MinIO | `curl localhost:9000/minio/health/live` | 30s |
 | Backend | `curl localhost:8000/health` | 30s |
-| Nginx | `nginx -t` | 30s |
+| Nginx | 宿主机 `curl http://localhost` | 启动脚本检测 |
 
 ---

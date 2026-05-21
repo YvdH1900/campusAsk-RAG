@@ -46,7 +46,7 @@ class QAService:
         self.timeout = 30  # API 超时（秒）
         self.answer_cache_ttl = 86400  # 回答缓存 24 小时
         self.use_semantic_cache = True  # 是否启用语义缓存
-        self.use_answer_verification = True  # 是否启用答案验证
+        self.use_answer_verification = False  # 默认禁用（AI 验证不稳定，中文覆盖率算法不适用）
         self.max_total_retries = 5  # 最大总重试次数（跨所有调用）
         self._last_features = {}  # 记录上次使用的功能状态
 

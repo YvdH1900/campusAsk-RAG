@@ -20,7 +20,7 @@ class AnswerVerifier:
     def __init__(self):
         """初始化答案验证器"""
         self.min_context_coverage = 0.3  # 最低上下文覆盖率
-        self.use_ai_verification = False  # 默认使用规则验证
+        self.use_ai_verification = False  # 默认禁用，LLM 格式解析易误判
 
     def verify(
         self,
