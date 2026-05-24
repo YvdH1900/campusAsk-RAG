@@ -130,7 +130,17 @@ def login(user_data: UserLogin, db: Session = Depends(get_db), request: Request 
     ip_address = None
     user_agent = None
     if request:
-        ip_address = request.client.host if request.client else None
+        # 优先从代理头获取真实IP
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            # X-Forwarded-For 可能包含多个IP，取第一个
+            ip_address = forwarded_for.split(",")[0].strip()
+        else:
+            real_ip = request.headers.get("x-real-ip")
+            if real_ip:
+                ip_address = real_ip
+            elif request.client:
+                ip_address = request.client.host
         user_agent = request.headers.get("user-agent")
     
     # 检查登录开关（管理员除外）
