@@ -21,19 +21,23 @@ class VectorStore:
     """向量存储服务"""
 
     CHILD_COLLECTION_NAME = "document_children"
+    TEMP_COLLECTION_NAME = "document_children_temp"
     DEFAULT_DIMENSION = 1024  # 默认向量维度
 
-    def __init__(self, db=None):
+    def __init__(self, db=None, collection_name: str = None, dimension_override: int = None):
         """
         初始化向量存储
         
         Args:
             db: 数据库会话（可选，用于动态读取向量维度）
+            collection_name: 集合名称（可选，用于操作临时集合）
+            dimension_override: 覆盖向量维度（可选，用于强制指定新维度）
         """
         self.db = db
+        self._collection_name = collection_name or self.CHILD_COLLECTION_NAME
         self.child_collection = None
         self._available = False
-        self._dimension = self._get_current_dimension()
+        self._dimension = dimension_override or self._get_current_dimension()
         self._initialize()
 
     def _get_current_dimension(self) -> int:
@@ -127,8 +131,7 @@ class VectorStore:
         if not self._available:
             raise RuntimeError("Milvus 服务不可用，请检查连接")
         try:
-            # 尝试 ping 测试连接
-            utility.has_collection(self.CHILD_COLLECTION_NAME)
+            utility.has_collection(self._collection_name)
             return True
         except Exception as e:
             logger.error(f"Milvus 连接测试失败: {str(e)}")
@@ -147,28 +150,28 @@ class VectorStore:
 
     def _ensure_collection(self):
         """确保集合存在且维度正确"""
-        if utility.has_collection(self.CHILD_COLLECTION_NAME):
-            # 检查现有集合的维度是否匹配
-            existing_collection = Collection(self.CHILD_COLLECTION_NAME)
+        if utility.has_collection(self._collection_name):
+            existing_collection = Collection(self._collection_name)
             schema = existing_collection.schema
             for field in schema.fields:
                 if field.name == "embedding":
-                    if field.params.get("dim") != self._dimension:
+                    existing_dim = field.params.get("dim")
+                    if existing_dim != self._dimension:
                         logger.warning(
-                            f"集合维度不匹配: 现有={field.params.get('dim')}, 期望={self._dimension}，重建集合"
+                            f"集合维度不匹配: 现有={existing_dim}, 期望={self._dimension}，"
+                            f"自动重建集合（旧维度数据对新模型无效，将被清除）"
                         )
-                        utility.drop_collection(self.CHILD_COLLECTION_NAME)
+                        utility.drop_collection(self._collection_name)
                         self._create_child_collection()
-                        # 重新加载集合
-                        self.child_collection = Collection(self.CHILD_COLLECTION_NAME)
+                        self.child_collection = Collection(self._collection_name)
                         self.child_collection.load()
                         return
                     break
         
-        if not utility.has_collection(self.CHILD_COLLECTION_NAME):
+        if not utility.has_collection(self._collection_name):
             self._create_child_collection()
         
-        self.child_collection = Collection(self.CHILD_COLLECTION_NAME)
+        self.child_collection = Collection(self._collection_name)
         self.child_collection.load()
 
     def _reconnect(self):
@@ -194,7 +197,7 @@ class VectorStore:
         ]
 
         schema = CollectionSchema(fields, description="文档子块集合（向量检索）")
-        collection = Collection(self.CHILD_COLLECTION_NAME, schema)
+        collection = Collection(self._collection_name, schema)
 
         # 创建 HNSW 向量索引
         index_params = {
@@ -211,6 +214,15 @@ class VectorStore:
         collection.create_index(field_name="document_id", index_name="doc_id_idx")
         collection.create_index(field_name="parent_id", index_name="parent_id_idx")
         collection.load()
+
+    def _create_child_collection_with_dim(self, dimension: int):
+        """使用指定维度创建子块集合（用于向量库重建）"""
+        saved_dim = self._dimension
+        self._dimension = dimension
+        try:
+            self._create_child_collection()
+        finally:
+            self._dimension = saved_dim
 
     def insert(
         self,
@@ -452,5 +464,5 @@ class VectorStore:
 
     def drop_collection(self):
         """删除集合（用于重置）"""
-        if utility.has_collection(self.CHILD_COLLECTION_NAME):
-            utility.drop_collection(self.CHILD_COLLECTION_NAME)
+        if utility.has_collection(self._collection_name):
+            utility.drop_collection(self._collection_name)

@@ -304,6 +304,7 @@ class ModelTestRequest(BaseModel):
     model_name: str
     api_key: str
     api_base_url: Optional[str] = None
+    dimension: Optional[int] = None
 
 
 class ModelTestResponse(BaseModel):
@@ -311,6 +312,7 @@ class ModelTestResponse(BaseModel):
     success: bool
     message: str
     latency_ms: Optional[int] = None
+    actual_dimension: Optional[int] = None
 
 
 # ==================== 登录记录相关 Schema ====================

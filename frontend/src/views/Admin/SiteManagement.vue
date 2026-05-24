@@ -739,7 +739,8 @@ const testLlmModel = async () => {
     if (response.ok) {
       const result = await response.json()
       if (result.success) {
-        ElMessage.success('测试成功！')
+        const dimInfo = result.actual_dimension ? `（维度: ${result.actual_dimension}）` : ''
+        ElMessage.success('测试成功！Embedding 模型连通正常' + dimInfo)
       } else {
         ElMessage.error('测试失败：' + (result.message || '未知错误'))
       }

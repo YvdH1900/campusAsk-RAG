@@ -671,6 +671,141 @@ def get_model_configs(
     return result
 
 
+def _test_model_connectivity(
+    model_type: str,
+    model_name: str,
+    api_key: str,
+    api_base_url: Optional[str] = None,
+    dimension: Optional[int] = None,
+) -> ModelTestResponse:
+    """
+    测试模型连通性（内部函数，供 create/update/activate 复用）
+    """
+    start_time = time.time()
+    
+    try:
+        if model_type == "embedding":
+            import dashscope
+            from dashscope import TextEmbedding
+            
+            original_key = os.environ.get("DASHSCOPE_API_KEY", "")
+            os.environ["DASHSCOPE_API_KEY"] = api_key
+            dashscope.api_key = api_key
+            
+            kwargs = {"model": model_name, "input": "测试文本"}
+            requested_dim = dimension
+            if requested_dim is not None:
+                kwargs["dimension"] = requested_dim
+            
+            response = TextEmbedding.call(**kwargs)
+            
+            os.environ["DASHSCOPE_API_KEY"] = original_key
+            dashscope.api_key = original_key
+            
+            if response.status_code == 200:
+                actual_embedding = response.output["embeddings"][0]["embedding"]
+                actual_dim = len(actual_embedding)
+                latency_ms = int((time.time() - start_time) * 1000)
+                
+                if requested_dim is not None and actual_dim != requested_dim:
+                    return ModelTestResponse(
+                        success=False,
+                        message=f"维度不匹配：请求 dimension={requested_dim}，API 返回 dimension={actual_dim}。"
+                                f"该模型不支持指定维度，请使用默认值 {actual_dim}。",
+                        actual_dimension=actual_dim,
+                        latency_ms=latency_ms
+                    )
+                
+                return ModelTestResponse(
+                    success=True,
+                    message=f"Embedding 模型测试通过 (维度={actual_dim})",
+                    actual_dimension=actual_dim,
+                    latency_ms=latency_ms
+                )
+            else:
+                return ModelTestResponse(
+                    success=False,
+                    message=f"Embedding 模型测试失败: {response.message}"
+                )
+        
+        elif model_type == "llm":
+            import dashscope
+            from dashscope import Generation
+            
+            original_key = os.environ.get("DASHSCOPE_API_KEY", "")
+            os.environ["DASHSCOPE_API_KEY"] = api_key
+            dashscope.api_key = api_key
+            
+            response = Generation.call(
+                model=model_name,
+                prompt="你好",
+                max_tokens=10
+            )
+            
+            os.environ["DASHSCOPE_API_KEY"] = original_key
+            dashscope.api_key = original_key
+            
+            if response.status_code == 200:
+                latency_ms = int((time.time() - start_time) * 1000)
+                return ModelTestResponse(
+                    success=True,
+                    message="LLM 模型测试通过",
+                    latency_ms=latency_ms
+                )
+            else:
+                return ModelTestResponse(
+                    success=False,
+                    message=f"LLM 模型测试失败: {response.message}"
+                )
+        
+        elif model_type == "reranker":
+            try:
+                import dashscope
+                from http import HTTPStatus
+                
+                original_key = dashscope.api_key
+                dashscope.api_key = api_key
+                
+                response = dashscope.TextReRank.call(
+                    model=model_name,
+                    query="测试问题",
+                    documents=["测试文档一", "测试文档二"],
+                    top_n=2
+                )
+                
+                latency_ms = int((time.time() - start_time) * 1000)
+                dashscope.api_key = original_key
+                
+                if response.status_code == HTTPStatus.OK:
+                    return ModelTestResponse(
+                        success=True,
+                        message="Reranker API 测试通过",
+                        latency_ms=latency_ms
+                    )
+                else:
+                    return ModelTestResponse(
+                        success=False,
+                        message=f"Reranker API 测试失败: {response.message}"
+                    )
+            except Exception as e:
+                return ModelTestResponse(
+                    success=False,
+                    message=f"Reranker API 测试异常: {str(e)}"
+                )
+        
+        else:
+            return ModelTestResponse(
+                success=False,
+                message="不支持的模型类型"
+            )
+    
+    except Exception as e:
+        return ModelTestResponse(
+            success=False,
+            message=f"测试异常: {str(e)}"
+        )
+
+
 @router.post("/model-configs", response_model=ModelConfigResponse, status_code=status.HTTP_201_CREATED)
 def create_model_config(
     config_data: ModelConfigCreate,
@@ -678,7 +813,7 @@ def create_model_config(
     current_user: User = Depends(require_admin)
 ):
     """
-    创建模型配置
+    创建模型配置（保存前强制测试连通性）
     """
     if config_data.model_type not in ["llm", "embedding", "reranker"]:
         raise HTTPException(
@@ -686,7 +821,6 @@ def create_model_config(
             detail="模型类型必须是 'llm'、'embedding' 或 'reranker'"
         )
     
-    # 检查是否已存在同名模型
     existing = db.query(ModelConfig).filter(
         and_(
             ModelConfig.model_type == config_data.model_type,
@@ -698,6 +832,20 @@ def create_model_config(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"已存在名为 '{config_data.model_name}' 的{config_data.model_type}模型配置"
+        )
+    
+    # 保存前强制测试连通性
+    test_result = _test_model_connectivity(
+        config_data.model_type,
+        config_data.model_name,
+        config_data.api_key,
+        config_data.api_base_url,
+        config_data.dimension
+    )
+    if not test_result.success:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"连通性测试失败，无法保存: {test_result.message}"
         )
     
     new_config = ModelConfig(
@@ -715,7 +863,6 @@ def create_model_config(
     db.commit()
     db.refresh(new_config)
     
-    # 脱敏处理
     response = ModelConfigResponse.model_validate(new_config)
     if response.api_key and len(response.api_key) > 8:
         response.api_key = response.api_key[:4] + "***" + response.api_key[-4:]
@@ -731,7 +878,7 @@ def update_model_config(
     current_user: User = Depends(require_admin)
 ):
     """
-    更新模型配置
+    更新模型配置（保存前强制测试连通性）
     """
     config = db.query(ModelConfig).filter(ModelConfig.id == config_id).first()
     if not config:
@@ -740,8 +887,25 @@ def update_model_config(
             detail="模型配置不存在"
         )
     
-    # 允许修改配置，包括正在使用的配置
-    # 激活操作会单独处理
+    # 保存前强制测试连通性（有变更才测）
+    test_model_name = config_data.model_name if config_data.model_name is not None else config.model_name
+    test_api_key = config_data.api_key if config_data.api_key is not None else config.api_key
+    test_api_base_url = config_data.api_base_url if config_data.api_base_url is not None else config.api_base_url
+    test_dimension = config_data.dimension if config_data.dimension is not None else config.dimension
+    
+    test_result = _test_model_connectivity(
+        config.model_type,
+        test_model_name,
+        test_api_key,
+        test_api_base_url,
+        test_dimension
+    )
+    if not test_result.success:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"连通性测试失败，无法保存: {test_result.message}"
+        )
+    
     if config_data.model_name is not None:
         config.model_name = config_data.model_name
     if config_data.api_key is not None:
@@ -756,7 +920,6 @@ def update_model_config(
     db.commit()
     db.refresh(config)
     
-    # 脱敏处理
     response = ModelConfigResponse.model_validate(config)
     if response.api_key and len(response.api_key) > 8:
         response.api_key = response.api_key[:4] + "***" + response.api_key[-4:]
@@ -800,123 +963,13 @@ def test_model_connection(
     """
     测试模型连通性
     """
-    start_time = time.time()
-    
-    try:
-        if test_data.model_type == "llm":
-            # 测试 LLM 模型
-            import dashscope
-            from dashscope import Generation
-            
-            original_key = os.environ.get("DASHSCOPE_API_KEY", "")
-            os.environ["DASHSCOPE_API_KEY"] = test_data.api_key
-            dashscope.api_key = test_data.api_key
-            
-            response = Generation.call(
-                model=test_data.model_name,
-                prompt="你好",
-                max_tokens=10
-            )
-            
-            os.environ["DASHSCOPE_API_KEY"] = original_key
-            dashscope.api_key = original_key
-            
-            if response.status_code == 200:
-                latency_ms = int((time.time() - start_time) * 1000)
-                return ModelTestResponse(
-                    success=True,
-                    message="LLM 模型测试通过",
-                    latency_ms=latency_ms
-                )
-            else:
-                return ModelTestResponse(
-                    success=False,
-                    message=f"LLM 模型测试失败: {response.message}"
-                )
-        
-        elif test_data.model_type == "embedding":
-            # 测试 Embedding 模型
-            import dashscope
-            from dashscope import TextEmbedding
-            
-            original_key = os.environ.get("DASHSCOPE_API_KEY", "")
-            os.environ["DASHSCOPE_API_KEY"] = test_data.api_key
-            dashscope.api_key = test_data.api_key
-            
-            response = TextEmbedding.call(
-                model=test_data.model_name,
-                input="测试文本"
-            )
-            
-            os.environ["DASHSCOPE_API_KEY"] = original_key
-            dashscope.api_key = original_key
-            
-            if response.status_code == 200:
-                latency_ms = int((time.time() - start_time) * 1000)
-                return ModelTestResponse(
-                    success=True,
-                    message="Embedding 模型测试通过",
-                    latency_ms=latency_ms
-                )
-            else:
-                return ModelTestResponse(
-                    success=False,
-                    message=f"Embedding 模型测试失败: {response.message}"
-                )
-        
-        elif test_data.model_type == "reranker":
-            # 测试 Reranker 模型（API 调用测试）
-            try:
-                import dashscope
-                from http import HTTPStatus
-                
-                # 临时设置 API Key
-                original_key = dashscope.api_key
-                dashscope.api_key = test_data.api_key
-                
-                try:
-                    # 调用 Reranker API
-                    response = dashscope.TextReRank.call(
-                        model=test_data.model_name,
-                        query="测试问题",
-                        documents=["测试文档一", "测试文档二"],
-                        top_n=2
-                    )
-                    
-                    latency_ms = int((time.time() - start_time) * 1000)
-                    
-                    if response.status_code == HTTPStatus.OK:
-                        return ModelTestResponse(
-                            success=True,
-                            message=f"Reranker API 测试通过",
-                            latency_ms=latency_ms
-                        )
-                    else:
-                        return ModelTestResponse(
-                            success=False,
-                            message=f"Reranker API 测试失败: {response.message}"
-                        )
-                finally:
-                    # 恢复原始 API Key
-                    dashscope.api_key = original_key
-                    
-            except Exception as e:
-                return ModelTestResponse(
-                    success=False,
-                    message=f"Reranker API 测试异常: {str(e)}"
-                )
-        
-        else:
-            return ModelTestResponse(
-                success=False,
-                message="不支持的模型类型"
-            )
-    
-    except Exception as e:
-        return ModelTestResponse(
-            success=False,
-            message=f"测试异常: {str(e)}"
-        )
+    return _test_model_connectivity(
+        test_data.model_type,
+        test_data.model_name,
+        test_data.api_key,
+        test_data.api_base_url,
+        test_data.dimension
+    )
 
 
 @router.post("/model-configs/{config_id}/activate")
@@ -937,13 +990,14 @@ def activate_model_config(
             detail="模型配置不存在"
         )
     
-    # 测试连通性
+    # 测试连通性（含维度验证）
     test_result = test_model_connection(
         ModelTestRequest(
             model_type=config.model_type,
             model_name=config.model_name,
             api_key=config.api_key,
-            api_base_url=config.api_base_url
+            api_base_url=config.api_base_url,
+            dimension=config.dimension
         ),
         db,
         current_user
@@ -1052,130 +1106,196 @@ def _detect_embedding_dimension(model_name: str, api_key: str) -> int | None:
 
 def rebuild_vector_store(task_id: str, config_id: int, model_name: str, api_key: str, api_base_url: str, db: Session):
     """
-    重建向量库（后台任务）
+    重建向量库（后台任务，临时集合策略）
+    
+    使用临时集合先构建全部数据，全部成功后原子切换到正式集合。
+    维度以 ModelConfig.dimension 为准，若未配置则自动检测。
+    如果中途失败，只清除临时集合，旧数据完好无损。
     """
     import dashscope
+    from pymilvus import utility
     from app.services.vector_store import VectorStore
-    from app.services.document_processor import DocumentProcessor
+    from app.services.document_parser import DocumentParser
+    from app.services.text_splitter import TextSplitter
+    from app.services.embedding_service import EmbeddingService
     from app.models import Document, ModelConfig
-    
-    original_config_id = None
-    original_model_name = None
-    
+
+    TEMP_COLLECTION = "document_children_temp"
+    MAIN_COLLECTION = "document_children"
+
     try:
-        # 保存原始配置 ID，用于失败时恢复
-        original_active = db.query(ModelConfig).filter(
-            ModelConfig.model_type == "embedding",
-            ModelConfig.is_active == True
-        ).first()
-        if original_active:
-            original_config_id = original_active.id
-            original_model_name = original_active.model_name
-        
         progress_store.update_task(task_id, 0, "初始化", "正在准备重建环境")
-        
+
         original_key = os.environ.get("DASHSCOPE_API_KEY", "")
-        
         os.environ["DASHSCOPE_API_KEY"] = api_key
         dashscope.api_key = api_key
 
-        # 确定向量维度：已手动配置 > 自动检测 > 默认值
-        progress_store.update_task(task_id, 5, "确定维度", "正在获取向量维度")
+        # 1. 确定向量维度（以 ModelConfig.dimension 为准）
+        progress_store.update_task(task_id, 5, "确定维度", "正在确定向量维度")
         target_config = db.query(ModelConfig).filter(ModelConfig.id == config_id).first()
-        resolved_dim = None
+
         if target_config and target_config.dimension:
             resolved_dim = target_config.dimension
             logger.info(f"使用已配置的向量维度: {resolved_dim}")
         else:
             resolved_dim = _detect_embedding_dimension(model_name, api_key)
-            if resolved_dim and target_config:
-                target_config.dimension = resolved_dim
-                db.commit()
-                logger.info(f"自动检测向量维度并保存: {resolved_dim}")
-            elif not resolved_dim:
-                logger.warning("无法自动检测向量维度，将使用默认值")
-        
-        progress_store.update_task(task_id, 10, "清空向量库", "正在删除现有向量数据")
-        
-        vector_store = VectorStore(db=db)
-        vector_store.drop_collection()
-        
+            if resolved_dim:
+                logger.info(f"自动检测到向量维度: {resolved_dim}")
+                if target_config:
+                    target_config.dimension = resolved_dim
+                    db.commit()
+            else:
+                logger.warning("无法检测向量维度，将使用默认值")
+
+        if not resolved_dim:
+            raise ValueError("无法确定向量维度，重建中止")
+
+        # 2. 清理上次可能残留的临时集合
+        progress_store.update_task(task_id, 8, "清理环境", "清理残留临时集合")
+        if utility.has_collection(TEMP_COLLECTION):
+            utility.drop_collection(TEMP_COLLECTION)
+
+        # 3. 创建临时集合（指定维度）
+        progress_store.update_task(task_id, 10, "创建临时库", f"正在创建临时向量库 (维度={resolved_dim})")
+        temp_store = VectorStore(db=db, collection_name=TEMP_COLLECTION, dimension_override=resolved_dim)
+        if not temp_store._available:
+            raise RuntimeError("临时向量库创建失败，Milvus 不可用")
+
+        # 4. 获取所有已处理文档
         progress_store.update_task(task_id, 20, "查询文档", "正在获取所有已处理文档")
-        
         documents = db.query(Document).filter(Document.status == "completed").all()
         total_docs = len(documents)
-        
+
         if total_docs == 0:
             progress_store.complete_task(task_id, "没有需要重建的文档")
             os.environ["DASHSCOPE_API_KEY"] = original_key
             dashscope.api_key = original_key
             return
-        
+
         progress_store.update_task(task_id, 30, "开始重建", f"共有 {total_docs} 个文档需要重建")
-        
-        processor = DocumentProcessor()
+
+        parser = DocumentParser()
+        splitter = TextSplitter()
+        embedder = EmbeddingService()
         success_count = 0
         failed_docs = []
-        
+
         for idx, doc in enumerate(documents):
             try:
-                stage_progress = 30 + int((idx / total_docs) * 65)
+                stage_progress = 30 + int((idx / total_docs) * 55)
                 progress_store.update_task(
-                    task_id, 
-                    stage_progress, 
-                    "重建中", 
+                    task_id,
+                    stage_progress,
+                    "重建中",
                     f"正在处理文档 {idx + 1}/{total_docs}: {doc.filename}"
                 )
-                
-                processor.delete_document_vectors(doc.id, db=db)
-                processor.process_document(doc, db)
+
+                text = parser.parse(doc.file_path)
+                if not text.strip():
+                    raise ValueError("文档内容为空")
+
+                chunks = splitter.split(text)
+                if not chunks:
+                    raise ValueError("文档分块后为空")
+
+                child_contents = [chunk["child_content"] for chunk in chunks]
+                embeddings = embedder.embed_batch(
+                    child_contents, db=db, model_name_override=model_name,
+                    dimension_override=resolved_dim
+                )
+
+                temp_store.insert(doc.id, chunks, embeddings)
                 success_count += 1
-                
+
             except Exception as doc_error:
                 logger.error(f"文档 {doc.id} 重建失败：{str(doc_error)}")
                 failed_docs.append(doc.filename)
-        
-        progress_store.update_task(task_id, 95, "清理优化", "正在清理孤儿向量")
-        
-        vector_store.delete_orphan_vectors()
-        
+
+        # 5. 判断结果
         if failed_docs:
+            progress_store.update_task(task_id, 88, "回滚中", "重建失败，正在清理临时数据")
+            temp_store.drop_collection()
+
             error_msg = f"部分文档重建失败：{success_count}/{total_docs} 成功，{len(failed_docs)} 失败"
-            if failed_docs:
-                error_msg += f"\n失败文档：{', '.join(failed_docs[:5])}"
-                if len(failed_docs) > 5:
-                    error_msg += f" 等{len(failed_docs)}个文档"
+            failed_preview = ", ".join(failed_docs[:5])
+            if len(failed_docs) > 5:
+                failed_preview += f" 等{len(failed_docs)}个文档"
+            error_msg += f"\n失败文档：{failed_preview}"
             progress_store.fail_task(task_id, error_msg)
-            
-            logger.error(f"向量库重建部分失败：{error_msg}")
+            logger.error(f"向量库重建部分失败，旧数据完整保留：{error_msg}")
+
         else:
-            progress_store.complete_task(task_id, f"向量库重建完成，共重建 {success_count} 个文档")
-            logger.info(f"向量库重建成功：{success_count} 个文档")
-        
-        # 恢复原始配置
+            # 全部成功 → 原子切换
+            progress_store.update_task(task_id, 88, "原子切换", "正在切换到新的向量库")
+
+            progress_store.update_task(task_id, 90, "切换中", "正在创建正式向量库")
+            if utility.has_collection(MAIN_COLLECTION):
+                utility.drop_collection(MAIN_COLLECTION)
+
+            new_main = VectorStore(db=db, collection_name=MAIN_COLLECTION,
+                                   dimension_override=resolved_dim)
+
+            for idx, doc in enumerate(documents):
+                try:
+                    stage_progress = 90 + int((idx / total_docs) * 5)
+                    progress_store.update_task(
+                        task_id, stage_progress, "切换中",
+                        f"写入正式库 {idx + 1}/{total_docs}: {doc.filename}"
+                    )
+
+                    text = parser.parse(doc.file_path)
+                    chunks = splitter.split(text)
+                    child_contents = [chunk["child_content"] for chunk in chunks]
+                    embeddings = embedder.embed_batch(
+                        child_contents, db=db, model_name_override=model_name,
+                        dimension_override=resolved_dim
+                    )
+                    new_main.insert(doc.id, chunks, embeddings)
+                except Exception as final_error:
+                    logger.error(f"写入正式库失败: {doc.id}, {str(final_error)}")
+                    raise
+
+            progress_store.update_task(task_id, 96, "清理", "删除临时集合")
+            temp_store.drop_collection()
+
+            progress_store.update_task(task_id, 98, "优化", "清理孤儿向量")
+            new_main.delete_orphan_vectors()
+
+            progress_store.update_task(task_id, 99, "激活", "激活新模型配置")
+            db.query(ModelConfig).filter(
+                ModelConfig.model_type == "embedding",
+                ModelConfig.is_active == True
+            ).update({"is_active": False})
+            target_config = db.query(ModelConfig).filter(ModelConfig.id == config_id).first()
+            if target_config:
+                target_config.is_active = True
+                db.commit()
+
+            progress_store.complete_task(
+                task_id, f"向量库重建完成，共重建 {success_count} 个文档"
+            )
+            logger.info(f"向量库重建成功：{success_count} 个文档，维度={resolved_dim}")
+
         os.environ["DASHSCOPE_API_KEY"] = original_key
         dashscope.api_key = original_key
-        
+
     except Exception as e:
         logger.error(f"向量库重建失败：{str(e)}")
         error_message = f"重建失败：{str(e)}"
         progress_store.fail_task(task_id, error_message)
-        
-        # 失败回滚：恢复原始配置状态
-        if original_config_id:
-            try:
-                db.query(ModelConfig).filter(
-                    ModelConfig.model_type == "embedding",
-                    ModelConfig.is_active == True
-                ).update({"is_active": False})
-                
-                original_config = db.query(ModelConfig).filter(ModelConfig.id == original_config_id).first()
-                if original_config:
-                    original_config.is_active = True
-                    db.commit()
-                    logger.info(f"已回滚到原始配置：{original_model_name}")
-            except Exception as rollback_error:
-                logger.error(f"回滚配置失败：{str(rollback_error)}")
+
+        try:
+            if utility.has_collection(TEMP_COLLECTION):
+                utility.drop_collection(TEMP_COLLECTION)
+                logger.info("已清理临时集合")
+        except Exception:
+            pass
+
+        try:
+            os.environ["DASHSCOPE_API_KEY"] = original_key
+            dashscope.api_key = original_key
+        except Exception:
+            pass
 
 
 def rebuild_vector_store_with_db(task_id: str, config_id: int, model_name: str, api_key: str, api_base_url: str):
@@ -1183,22 +1303,16 @@ def rebuild_vector_store_with_db(task_id: str, config_id: int, model_name: str, 
     重建向量库（带独立数据库会话）
     """
     from app.core.database import SessionLocal
+    from app.models import ModelConfig
     db = SessionLocal()
     try:
         rebuild_vector_store(task_id, config_id, model_name, api_key, api_base_url, db)
-        
-        # 重建完成后，更新模型配置状态
-        if progress_store.get_task(task_id) and progress_store.get_task(task_id).status.value == "completed":
+
+        # 重建完成后，同步更新环境变量（确保重启后也能使用）
+        task = progress_store.get_task(task_id)
+        if task and task.status.value == "completed":
             config = db.query(ModelConfig).filter(ModelConfig.id == config_id).first()
             if config:
-                db.query(ModelConfig).filter(
-                    ModelConfig.model_type == "embedding", 
-                    ModelConfig.is_active == True
-                ).update({"is_active": False})
-                config.is_active = True
-                db.commit()
-                
-                # 同步更新环境变量（确保重启后也能使用）
                 os.environ["DASHSCOPE_API_KEY"] = config.api_key
                 os.environ["EMBEDDING_MODEL"] = config.model_name
                 if config.dimension:

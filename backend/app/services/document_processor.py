@@ -103,7 +103,6 @@ class DocumentProcessor:
             logger.info(f"开始向量化文档: {document.filename}")
             total_chunks = len(child_contents)
             
-            # 直接调用 embed_batch，由 embedding_service 内部统一处理分批
             all_embeddings = self.embedder.embed_batch(child_contents, db=db)
 
             report_progress(80, 100, "存储向量")
