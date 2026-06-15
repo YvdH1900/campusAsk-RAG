@@ -233,8 +233,8 @@
               <el-tag v-else type="info" size="small" class="ml-2">使用启发式重排序</el-tag>
             </h3>
             <p class="settings-desc">
-              配置阿里云百炼平台的 Reranker API，提升检索结果排序质量。
-              推荐模型：gte-rerank。未配置时将使用基于分数的启发式重排序（零成本）。
+              配置提升检索结果排序质量。
+              未配置时将使用基于分数的启发式重排序。
             </p>
             <div class="model-config-form">
               <div class="form-row">
@@ -282,7 +282,6 @@
               <el-icon class="mr-2"><InfoFilled /></el-icon>
               功能模型使用情况
             </h3>
-            <p class="settings-desc">以下功能使用通义千问 LLM，无需额外配置</p>
             <div class="model-info-grid">
               <div class="model-info-item">
                 <div class="model-info-icon">
@@ -291,7 +290,16 @@
                 <div class="model-info-content">
                   <div class="model-info-name">查询扩展</div>
                   <div class="model-info-desc">使用 LLM 生成语义相似的变体问题</div>
-                  <el-tag type="success" size="small">通义千问 LLM</el-tag>
+                  <div class="model-info-controls">
+                    <el-tag :type="featureStatus.query_expansion?.active ? 'success' : 'info'" size="small">
+                      {{ featureStatus.query_expansion?.active ? '已启用' : '未启用' }}
+                    </el-tag>
+                    <el-switch
+                      v-model="featureStatus.query_expansion.enabled"
+                      @change="toggleFeature('query_expansion', $event)"
+                      :disabled="!featureStatus.query_expansion?.llm_available"
+                    />
+                  </div>
                 </div>
               </div>
               <div class="model-info-item">
@@ -301,7 +309,16 @@
                 <div class="model-info-content">
                   <div class="model-info-name">对话摘要</div>
                   <div class="model-info-desc">使用 LLM 压缩过长对话历史</div>
-                  <el-tag type="success" size="small">通义千问 LLM</el-tag>
+                  <div class="model-info-controls">
+                    <el-tag :type="featureStatus.conversation_summary?.active ? 'success' : 'info'" size="small">
+                      {{ featureStatus.conversation_summary?.active ? '已启用' : '未启用' }}
+                    </el-tag>
+                    <el-switch
+                      v-model="featureStatus.conversation_summary.enabled"
+                      @change="toggleFeature('conversation_summary', $event)"
+                      :disabled="!featureStatus.conversation_summary?.llm_available"
+                    />
+                  </div>
                 </div>
               </div>
               <div class="model-info-item">
@@ -311,7 +328,16 @@
                 <div class="model-info-content">
                   <div class="model-info-name">答案验证</div>
                   <div class="model-info-desc">使用 LLM 验证答案是否基于上下文</div>
-                  <el-tag type="success" size="small">通义千问 LLM</el-tag>
+                  <div class="model-info-controls">
+                    <el-tag :type="featureStatus.answer_verification?.active ? 'success' : 'info'" size="small">
+                      {{ featureStatus.answer_verification?.active ? '已启用' : '未启用' }}
+                    </el-tag>
+                    <el-switch
+                      v-model="featureStatus.answer_verification.enabled"
+                      @change="toggleFeature('answer_verification', $event)"
+                      :disabled="!featureStatus.answer_verification?.llm_available"
+                    />
+                  </div>
                 </div>
               </div>
               <div class="model-info-item">
@@ -320,10 +346,16 @@
                 </div>
                 <div class="model-info-content">
                   <div class="model-info-name">重排序</div>
-                  <div class="model-info-desc">使用阿里云 Reranker API 或启发式算法</div>
-                  <el-tag :type="currentRerankerModelName ? 'success' : 'info'" size="small">
-                    {{ currentRerankerModelName ? 'API 重排序' : '启发式重排序' }}
-                  </el-tag>
+                  <div class="model-info-desc">使用 Reranker API 或启发式算法</div>
+                  <div class="model-info-controls">
+                    <el-tag :type="featureStatus.reranking?.active ? 'success' : 'info'" size="small">
+                      {{ featureStatus.reranking?.active ? '已启用' : '已禁用' }}
+                    </el-tag>
+                    <el-switch
+                      v-model="featureStatus.reranking.enabled"
+                      @change="toggleFeature('reranking', $event)"
+                    />
+                  </div>
                 </div>
               </div>
             </div>
@@ -490,6 +522,9 @@ const currentLlmModelName = ref<string>('')
 const currentEmbeddingModelName = ref<string>('')
 const currentRerankerModelName = ref<string>('')
 
+// 功能启用状态
+const featureStatus = ref<any>({})
+
 const loginRecords = ref<any[]>([])
 
 const loadedTabs = new Set<string>(['announcements'])
@@ -503,6 +538,7 @@ const handleTabChange = (tab: string) => {
     fetchSettings()
   } else if (tab === 'models') {
     fetchModelConfigs()
+    fetchFeatureStatus()
   } else if (tab === 'loginRecords') {
     fetchLoginRecords()
   }
@@ -638,6 +674,28 @@ const fetchSettings = async () => {
   }
 }
 
+const toggleFeature = async (feature: string, enabled: boolean) => {
+  try {
+    const response = await fetch(`/api/v1/chat/feature-toggle?feature=${feature}&enabled=${enabled}`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${sessionStorage.getItem('token')}`,
+      },
+    })
+    if (response.ok) {
+      const data = await response.json()
+      ElMessage.success(data.message)
+      // 刷新状态
+      await fetchFeatureStatus()
+    } else {
+      ElMessage.error('切换失败')
+    }
+  } catch (error) {
+    console.error('切换功能失败:', error)
+    ElMessage.error('切换失败')
+  }
+}
+
 const updateSetting = async (key: string, value: boolean) => {
   try {
     const response = await fetch(`/api/v1/admin/settings/${key}`, {
@@ -657,6 +715,17 @@ const updateSetting = async (key: string, value: boolean) => {
     }
   } catch (error) {
     console.error('更新设置失败:', error)
+  }
+}
+
+const fetchFeatureStatus = async () => {
+  try {
+    const response = await fetch('/api/v1/chat/feature-status')
+    if (response.ok) {
+      featureStatus.value = await response.json()
+    }
+  } catch (error) {
+    console.error('获取功能状态失败:', error)
   }
 }
 
@@ -1464,6 +1533,12 @@ onMounted(() => {
   color: var(--text-secondary);
   margin-bottom: var(--space-2);
   line-height: 1.5;
+}
+
+.model-info-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
 }
 
 .rebuild-progress-dialog {

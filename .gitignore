@@ -63,10 +63,12 @@ htmlcov/
 *.sqlite
 *.sqlite3
 
-# 上传和临时文件
-uploads/
-temp/
-tmp/
+# 测试运行时产物（统一收纳到 backend/tests/tmp_test/）
+backend/tests/tmp_test/
+
+# 管道测试报告
+gen_report.json
+pipeline_report.json
 
 # Docker 运行时数据
 volumes/

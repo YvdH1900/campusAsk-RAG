@@ -176,14 +176,19 @@ class DocumentParser:
 
     @staticmethod
     def _parse_pdf(file_path: str) -> str:
-        """解析 PDF 文件"""
+        """解析 PDF 文件（带清理：移除页码、年份标记、单字符行、空白行）"""
+        import re
         text_parts = []
         with pdf_open(file_path) as pdf:
             for page in pdf.pages:
                 page_text = page.extract_text()
-                if page_text:
-                    text_parts.append(page_text)
-        return "\n\n".join(text_parts)
+                if not page_text:
+                    continue
+                page_lines = page_text.split(chr(10))
+                cleaned = [l for l in page_lines if l.strip() and not re.match(r"^\d{1,4}$", l.strip()) and len(l.strip()) > 1]
+                if cleaned:
+                    text_parts.append(chr(10).join(cleaned))
+        return chr(10).join(text_parts)
 
     @staticmethod
     def _parse_pdf_stream(file_path: str, chunk_pages: int) -> Generator[str, None, None]:

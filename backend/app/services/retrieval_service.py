@@ -50,12 +50,34 @@ class RetrievalService:
         self.use_multi_path = True  # 是否启用多路召回
         self.use_quality_filter = True  # 是否启用质量过滤
         self.use_semantic_cache = True  # 是否启用语义缓存
-        self.use_ai_expansion = True  # 是否启用 AI 查询扩展
+        self.use_ai_expansion = False  # 是否启用 AI 查询扩展
+        self.use_reranking = True  # 是否启用重排序
         self._reranker_model_name = None  # AI 重排序模型名称（从 DB 加载）
         self._reranker_api_key = None  # AI 重排序 API Key
         self._last_rerank_method = None  # 记录上次使用的重排序方法
+        self._full_bm25_built = False  # 全量BM25索引是否已构建
+        self._full_bm25_docs = []       # 全量文档列表
+        self._full_bm25_ids = []       # 全量文档对应的 parent_id 列表
         self._llm_model_name = None  # LLM 模型名称（用于查询扩展等）
         self._last_expansion_method = None  # 记录上次使用的查询扩展方法
+
+    def _load_settings_from_db(self, db=None):
+        """从数据库加载功能开关配置"""
+        if db:
+            try:
+                from app.models import SystemSetting
+                for key, attr in [
+                    ("query_expansion_enabled", "use_ai_expansion"),
+                    ("reranking_enabled", "use_reranking"),
+                ]:
+                    setting = db.query(SystemSetting).filter(
+                        SystemSetting.setting_key == key
+                    ).first()
+                    if setting:
+                        setattr(self, attr, setting.setting_value == "true")
+                        logger.info(f"从数据库加载配置 {key}: {getattr(self, attr)}")
+            except Exception as e:
+                logger.warning(f"读取功能配置失败: {e}")
 
     def _load_reranker_model(self, db=None):
         """从数据库加载重排序模型配置"""
@@ -123,6 +145,7 @@ class RetrievalService:
         query: str,
         vector_results: List[Dict],
         top_k: int,
+        intent: Optional[str] = None,
     ) -> List[Dict]:
         """
         混合检索：向量 + BM25 + 重排序
@@ -138,44 +161,84 @@ class RetrievalService:
         if not vector_results:
             return []
 
-        # 1. 构建 BM25 索引
-        self._build_bm25_index(vector_results)
-
-        # 2. BM25 关键词检索
-        bm25_results = self.bm25_service.search(query, top_k=top_k * 2)
-
-        # 3. 合并向量检索和 BM25 结果
-        bm25_map = {r["doc_id"]: r["score"] for r in bm25_results}
+        # 1. 全量 BM25 检索（不限于向量结果）
+        if not self._full_bm25_built:
+            try:
+                all_entities = self.vector_store.child_collection.query(
+                    expr="document_id > 0",
+                    output_fields=["child_content", "parent_id"],
+                    limit=10000,
+                )
+                self._full_bm25_docs = []
+                self._full_bm25_ids = []
+                for e in all_entities:
+                    cc = e.get("child_content", "")
+                    pid = e.get("parent_id", "")
+                    if cc:
+                        self._full_bm25_docs.append(cc)
+                        self._full_bm25_ids.append(pid)
+                if self._full_bm25_docs:
+                    self.bm25_service.build_index(self._full_bm25_docs)
+                self._full_bm25_built = True
+            except Exception as e:
+                logger.warning(f"全量BM25索引构建失败: {e}")
         
+        full_bm25_by_pid = {}
+        if self._full_bm25_built:
+            full_bm25_results = self.bm25_service.search(query, top_k=top_k * 3)
+            max_bm25 = max((r["score"] for r in full_bm25_results), default=1)
+            for r in full_bm25_results:
+                doc_id = r["doc_id"]
+                if doc_id < len(self._full_bm25_ids):
+                    pid = self._full_bm25_ids[doc_id]
+                    score = r["score"] / max_bm25 if max_bm25 > 0 else 0
+                    full_bm25_by_pid[pid] = max(full_bm25_by_pid.get(pid, 0), score)
+        
+        # 2. 动态权重：长文本查询增加 BM25 权重
+        intent_weights = {
+            "fact":     {"vector": 0.7, "bm25": 0.3},
+            "process":  {"vector": 0.4, "bm25": 0.6},
+            "policy":   {"vector": 0.5, "bm25": 0.5},
+            "chat":     {"vector": 0.8, "bm25": 0.2},
+        }
+        if intent in intent_weights:
+            bm25_weight = intent_weights[intent]["bm25"]
+        else:
+            chinese_chars = sum(1 for c in query if "\u4e00" <= c <= "\u9fff")
+            bm25_weight = 0.5 if chinese_chars > 10 else 0.4
+        vector_weight = 1.0 - bm25_weight
+        
+        # 3. 按 parent_id 匹配 BM25 分数
         hybrid_results = []
         for i, vec_result in enumerate(vector_results):
             vec_score = vec_result.get("score", 0)
-            bm25_score = bm25_map.get(i, 0)
+            pid = str(vec_result.get("parent_id", ""))
+            full_bm25 = full_bm25_by_pid.get(pid, 0)
             
-            # 归一化 BM25 分数到 [0, 1]
-            max_bm25 = max(bm25_map.values()) if bm25_map else 1
-            normalized_bm25 = bm25_score / max_bm25 if max_bm25 > 0 else 0
-            
-            # 混合评分：向量 60% + BM25 40%
-            combined_score = 0.6 * vec_score + 0.4 * normalized_bm25
+            # 混合评分
+            combined_score = vector_weight * vec_score + bm25_weight * full_bm25
             
             hybrid_results.append({
                 **vec_result,
                 "score": round(combined_score, 4),
                 "vector_score": round(vec_score, 4),
-                "bm25_score": round(normalized_bm25, 4),
+                "bm25_score": round(full_bm25, 4),
             })
 
-        # 4. 重排序
-        reranked = self.reranker.rerank(
-            query, hybrid_results, top_k=top_k,
-            ai_model_name=self._reranker_model_name,
-            api_key=getattr(self, '_reranker_api_key', None)
-        )
-        
-        # 记录使用的重排序方法
-        if reranked:
-            self._last_rerank_method = reranked[0].get("rerank_method", "unknown")
+        # 4. 重排序（可关闭）
+        if self.use_reranking:
+            reranked = self.reranker.rerank(
+                query, hybrid_results, top_k=top_k,
+                ai_model_name=self._reranker_model_name,
+                api_key=getattr(self, '_reranker_api_key', None)
+            )
+            # 记录使用的重排序方法
+            if reranked:
+                self._last_rerank_method = reranked[0].get("rerank_method", "unknown")
+        else:
+            # 关闭重排序，直接按混合评分排序返回
+            reranked = sorted(hybrid_results, key=lambda x: x["score"], reverse=True)[:top_k]
+            self._last_rerank_method = "disabled"
 
         return reranked
 
@@ -227,6 +290,8 @@ class RetrievalService:
 
         # 2. 动态调整 top_k
         dynamic_top_k = strategy.get("top_k", top_k)
+        # 不让意图分类器减少 top_k（评测需要更多结果来提高召回）
+        dynamic_top_k = max(dynamic_top_k, top_k)
         logger.info(f"动态 Top-K: {top_k} -> {dynamic_top_k} (意图: {intent})")
 
         # 3. 语义缓存检查
@@ -236,9 +301,10 @@ class RetrievalService:
                 logger.info(f"语义缓存命中，跳过检索")
                 return cached_answer.get("contexts", [])
 
-        # 3.5 加载重排序模型和 LLM 模型
+        # 3.5 加载重排序模型、LLM 模型和功能开关配置
         self._load_reranker_model(db)
         self._load_llm_model(db)
+        self._load_settings_from_db(db)
 
         # 4. 查询扩展（优先 AI 扩展，失败降级规则扩展）
         retrieval_query = question
@@ -285,6 +351,7 @@ class RetrievalService:
             query=retrieval_query,
             vector_results=vector_results,
             top_k=dynamic_top_k,
+            intent=intent,
         )
 
         if not hybrid_results:

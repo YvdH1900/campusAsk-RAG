@@ -76,13 +76,14 @@ class Settings(BaseSettings):
     # 文本向量化 Embedding 模型
     # 使用通义千问的 Embedding 模型
     # text-embedding-v3 是阿里云百炼平台提供的高质量 Embedding 模型
-    EMBEDDING_MODEL: str = "text-embedding-v3"
+    EMBEDDING_MODEL: str = "text-embedding-v4"
+    EMBEDDING_DIMENSION: int = 1024
     
     # ==================== 重排序模型配置 ====================
     # 重排序模型名称（阿里云百炼平台 API 模型）
     # 使用阿里云的 Reranker API，无需本地模型
     # 推荐: gte-rerank（阿里云百炼平台提供的高质量重排序模型）
-    RERANKER_MODEL: str = "gte-rerank"
+    RERANKER_MODEL: str = "qwen3-rerank"
     
     # ==================== 安全配置 ====================
     # JWT Token 加密密钥

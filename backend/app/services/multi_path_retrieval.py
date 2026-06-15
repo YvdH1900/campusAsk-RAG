@@ -109,51 +109,44 @@ class MultiPathRetrieval:
                 logger.warning("向量库中没有文档数据，BM25路径返回空")
                 return []
             
-            # 去重：按 parent_id 去重，使用 parent_content
-            seen_parents = {}
+            # 使用全部子块内容构建BM25索引（761条×200字，粒度与向量搜索一致）
+            child_contents = []
+            child_docs = []
             for entity in all_entities:
-                parent_id = entity.get("parent_id")
-                if parent_id not in seen_parents:
-                    seen_parents[parent_id] = entity
-            
-            # 构建BM25索引（使用父块内容）
-            parent_contents = []
-            parent_docs = []
-            for parent_id, entity in seen_parents.items():
-                content = entity.get("parent_content", "")
+                content = entity.get("child_content", "")
                 if content:
-                    parent_contents.append(content)
-                    parent_docs.append({
+                    child_contents.append(content)
+                    child_docs.append({
                         "document_id": entity.get("document_id"),
-                        "parent_id": parent_id,
+                        "parent_id": entity.get("parent_id"),
                         "child_id": entity.get("child_id"),
-                        "parent_content": content,
-                        "child_content": entity.get("child_content", ""),
+                        "parent_content": entity.get("parent_content", ""),
+                        "child_content": content,
                     })
-            
-            if not parent_contents:
+
+            if not child_contents:
                 return []
-            
-            self.bm25_service.build_index(parent_contents)
-            
+
+            self.bm25_service.build_index(child_contents)
+
             # BM25检索
             bm25_results = self.bm25_service.search(question, top_k=top_k)
-            
+
             # 转换为标准格式
             results = []
             for bm25_result in bm25_results:
                 doc_id = bm25_result.get("doc_id")
-                if doc_id is not None and doc_id < len(parent_docs):
-                    parent_doc = parent_docs[doc_id]
+                if doc_id is not None and doc_id < len(child_docs):
+                    doc = child_docs[doc_id]
                     results.append({
-                        "document_id": parent_doc["document_id"],
-                        "parent_id": parent_doc["parent_id"],
-                        "child_id": parent_doc["child_id"],
-                        "parent_content": parent_doc["parent_content"],
-                        "child_content": parent_doc["child_content"],
-                        "score": bm25_result.get("score", 0),
+                        "child_content": doc["child_content"],
+                        "parent_content": doc["parent_content"],
+                        "score": bm25_result["score"],
+                        "source": "BM25-" + str(doc["parent_id"]),
+                        "rerank_method": "bm25",
+                        "doc_id": doc_id,
+                        "parent_id": doc["parent_id"],
                     })
-            
             return results
         except Exception as e:
             logger.error(f"BM25检索失败: {str(e)}")

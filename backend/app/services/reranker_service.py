@@ -11,6 +11,7 @@ import logging
 import time
 import os
 from typing import List, Dict, Any, Optional
+import jieba
 import dashscope
 from http import HTTPStatus
 
@@ -156,13 +157,13 @@ class RerankerService:
     def _heuristic_rerank(self, query: str, results: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
         """基于分数的启发式重排序（fallback）"""
         query_lower = query.lower()
-        query_words = set(query_lower.split())
+        query_words = set(jieba.cut(query_lower))
         
         scored_results = []
         for r in results:
             content = r.get("content") or r.get("parent_content") or r.get("child_content") or r.get("text", "")
             content_lower = content.lower()
-            content_words = set(content_lower.split())
+            content_words = set(jieba.cut(content_lower))
             
             # 向量检索分数（已有）
             vector_score = r.get("score", r.get("vector_score", 0.5))

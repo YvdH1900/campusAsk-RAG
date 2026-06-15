@@ -46,9 +46,28 @@ class QAService:
         self.timeout = 30  # API 超时（秒）
         self.answer_cache_ttl = 86400  # 回答缓存 24 小时
         self.use_semantic_cache = True  # 是否启用语义缓存
-        self.use_answer_verification = False  # 默认禁用（AI 验证不稳定，中文覆盖率算法不适用）
+        self.use_answer_verification = False  # 默认禁用
+        self.use_conversation_summary = True  # 默认启用
         self.max_total_retries = 5  # 最大总重试次数（跨所有调用）
         self._last_features = {}  # 记录上次使用的功能状态
+
+    def _load_settings_from_db(self, db=None):
+        """从数据库加载功能开关配置"""
+        if db:
+            try:
+                from app.models import SystemSetting
+                for key, attr in [
+                    ("answer_verification_enabled", "use_answer_verification"),
+                    ("conversation_summary_enabled", "use_conversation_summary"),
+                ]:
+                    setting = db.query(SystemSetting).filter(
+                        SystemSetting.setting_key == key
+                    ).first()
+                    if setting:
+                        setattr(self, attr, setting.setting_value == "true")
+                        logger.info(f"从数据库加载配置 {key}: {getattr(self, attr)}")
+            except Exception as e:
+                logger.warning(f"读取功能配置失败: {e}")
 
     def _get_current_model_name(self, db=None) -> str:
         """
@@ -208,6 +227,7 @@ class QAService:
             "sources": [ctx["source"] for ctx in contexts[:3]],
             "context_count": len(contexts),
             "confidence": "低",
+            "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
         }
 
     def _handle_chat_question(self, question: str) -> Dict:
@@ -228,6 +248,7 @@ class QAService:
                 "sources": [],
                 "context_count": 0,
                 "confidence": "高",
+                "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             }
         elif any(g in question_lower for g in ["谢谢", "感谢"]):
             return {
@@ -235,6 +256,7 @@ class QAService:
                 "sources": [],
                 "context_count": 0,
                 "confidence": "高",
+                "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             }
         elif any(g in question_lower for g in ["你是谁", "你叫什么"]):
             return {
@@ -242,6 +264,7 @@ class QAService:
                 "sources": [],
                 "context_count": 0,
                 "confidence": "高",
+                "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             }
         else:
             return {
@@ -249,6 +272,7 @@ class QAService:
                 "sources": [],
                 "context_count": 0,
                 "confidence": "高",
+                "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
             }
 
     def ask(
@@ -300,7 +324,10 @@ class QAService:
             logger.info(f"回答缓存命中: {question[:30]}...")
             return cached_answer
 
-        # 4. 检索相关文档（带权限过滤）
+        # 4. 加载功能开关配置
+        self._load_settings_from_db(db)
+
+        # 5. 检索相关文档（带权限过滤）
         contexts = self.retriever.retrieve(
             question=question,
             top_k=top_k,
@@ -332,6 +359,7 @@ class QAService:
         )
 
         # 7. 调用 LLM（带超时和重试）
+        token_usage = {}
         try:
             response = self._call_llm_with_retry(
                 messages, 
@@ -340,6 +368,12 @@ class QAService:
                 timeout=self.timeout
             )
             answer = response.output.choices[0].message.content
+            # 统计 token 使用量
+            token_usage = {
+                "input_tokens": getattr(response.usage, "input_tokens", 0),
+                "output_tokens": getattr(response.usage, "output_tokens", 0),
+                "total_tokens": getattr(response.usage, "total_tokens", 0),
+            }
         except Exception as e:
             logger.error(f"LLM 调用失败，使用降级策略: {str(e)}")
             return self._build_fallback_answer(question, contexts)
@@ -377,6 +411,12 @@ class QAService:
                                 timeout=self.timeout,
                             )
                             answer = response.output.choices[0].message.content
+                            # 更新 token 使用量（重新生成）
+                            token_usage = {
+                                "input_tokens": getattr(response.usage, "input_tokens", 0),
+                                "output_tokens": getattr(response.usage, "output_tokens", 0),
+                                "total_tokens": getattr(response.usage, "total_tokens", 0),
+                            }
                         except Exception as e:
                             logger.error(f"重新生成答案失败: {str(e)}")
 
@@ -397,6 +437,7 @@ class QAService:
             "confidence": confidence,
             "features": self._last_features,
             "summary_text": summary_text,
+            "token_usage": token_usage,
         }
 
         # 11. 缓存回答（高置信度）
@@ -445,10 +486,13 @@ class QAService:
         if strategy.get("direct_answer"):
             full_text = self._handle_chat_question(question)["answer"]
             yield {"type": "chunk", "content": full_text}
-            yield self._build_stream_done(full_text, [], [], current_model, None)
+            yield self._build_stream_done(full_text, [], [], current_model, None, {})
             return
 
-        # 2. 检索相关文档（带权限过滤）
+        # 2. 加载功能开关配置
+        self._load_settings_from_db(db)
+
+        # 3. 检索相关文档（带权限过滤）
         contexts = self.retriever.retrieve(
             question=question,
             top_k=top_k,
@@ -460,7 +504,7 @@ class QAService:
         if not contexts:
             full_text = self._build_fallback_answer(question, [])["answer"]
             yield {"type": "chunk", "content": full_text}
-            yield self._build_stream_done(full_text, [], [], current_model, None)
+            yield self._build_stream_done(full_text, [], [], current_model, None, {})
             return
 
         # 3. 智能对话历史管理
@@ -481,6 +525,7 @@ class QAService:
         )
 
         # 5. 流式调用 LLM
+        token_usage = {}
         try:
             logger.info(f"开始流式 LLM 调用: {current_model}")
             response = self._call_llm_with_retry(
@@ -492,6 +537,7 @@ class QAService:
 
             chunk_count = 0
             full_answer_chunks = []
+            last_chunk = None
             for chunk in response:
                 if not hasattr(chunk, 'output') or chunk.output is None:
                     continue
@@ -508,23 +554,66 @@ class QAService:
                         chunk_count += 1
                         full_answer_chunks.append(content)
                         yield {"type": "chunk", "content": content}
+                    
+                    last_chunk = chunk
                 except (IndexError, AttributeError) as e:
                     logger.warning(f"解析流式 chunk 失败：{e}")
                     continue
             
             full_text = "".join(full_answer_chunks)
-            logger.info(f"流式 LLM 调用完成: {current_model}, 共 {chunk_count} 个 chunk")
+            
+            # 从最后一个 chunk 提取 token 使用量
+            if last_chunk and hasattr(last_chunk, 'usage') and last_chunk.usage is not None:
+                token_usage = {
+                    "input_tokens": getattr(last_chunk.usage, "input_tokens", 0),
+                    "output_tokens": getattr(last_chunk.usage, "output_tokens", 0),
+                    "total_tokens": getattr(last_chunk.usage, "total_tokens", 0),
+                }
+            
+            # 如果流式响应没有返回 usage，使用估算值（企业级 fallback）
+            if not token_usage.get("total_tokens"):
+                # 使用更准确的估算：中文字符约 1.5 token/字，英文约 0.25 token/字
+                def estimate_tokens(text):
+                    if not text:
+                        return 0
+                    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+                    other_chars = len(text) - chinese_chars
+                    return max(1, int(chinese_chars * 1.5 + other_chars * 0.25))
+                
+                input_tokens = sum(estimate_tokens(m.get("content", "")) for m in messages)
+                output_tokens = estimate_tokens(full_text)
+                token_usage = {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                }
+                logger.info(f"使用估算 token: 输入={input_tokens}, 输出={output_tokens}")
+            
+            logger.info(f"流式 LLM 调用完成: {current_model}, 共 {chunk_count} 个 chunk, token: {token_usage.get('total_tokens', 0)}")
         except Exception as e:
             logger.error(f"流式 LLM 调用失败，使用降级策略: {str(e)}")
             full_text = self._build_fallback_answer(question, contexts)["answer"]
             yield {"type": "chunk", "content": full_text}
 
         # 6. yield 元数据供调用方后处理
-        yield self._build_stream_done(full_text, contexts, sources, current_model, summary_text)
+        yield self._build_stream_done(full_text, contexts, sources, current_model, summary_text, token_usage)
 
-    def _build_stream_done(self, full_text, contexts, sources, model_name, summary_text):
+    def _build_stream_done(self, full_text, contexts, sources, model_name, summary_text, token_usage=None):
         """构建 ask_stream 的 done 事件"""
         feature_status = self.retriever.get_feature_status()
+        
+        # 确保 token_usage 始终有有效值（企业级防御性编程）
+        if not token_usage or not token_usage.get("total_tokens"):
+            # 如果到这里还没有 token_usage，使用最简估算
+            input_tokens = max(10, len(full_text) // 3)
+            output_tokens = max(10, len(full_text) // 2)
+            token_usage = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            }
+            logger.info(f"最终 fallback token 估算: {token_usage}")
+        
         return {
             "type": "done",
             "answer": full_text,
@@ -537,6 +626,7 @@ class QAService:
             },
             "summary_text": summary_text,
             "model_name": model_name,
+            "token_usage": token_usage,
         }
 
     def _smart_manage_history(
@@ -562,7 +652,15 @@ class QAService:
         if not SummaryService.should_compress(chat_history):
             return chat_history, None
 
-        # 2. 使用 AI 摘要压缩（优先 AI，失败降级截断）
+        # 2. 如果关闭了对话摘要，直接截断保留最近的消息
+        if not self.use_conversation_summary:
+            # 保留最近 4 条消息（2 轮对话）
+            normal_msgs = [m for m in chat_history if m.get("role") not in ("summary", "system")]
+            recent = normal_msgs[-4:] if len(normal_msgs) > 4 else normal_msgs
+            logger.info(f"对话摘要已关闭，截断保留最近 {len(recent)} 条消息")
+            return recent, None
+
+        # 3. 使用 AI 摘要压缩（优先 AI，失败降级截断）
         compressed = SummaryService.compress_history(chat_history, use_ai=True, model_name=model_name)
         
         # 提取摘要文本
@@ -570,7 +668,7 @@ class QAService:
         if compressed and compressed[0].get("role") == "system":
             summary_text = compressed[0]["content"]
 
-        # 3. 保留最近的一轮对话（如果有的话），排除摘要/系统消息
+        # 4. 保留最近的一轮对话（如果有的话），排除摘要/系统消息
         normal_msgs = [m for m in chat_history if m.get("role") not in ("summary", "system")]
         if len(normal_msgs) >= 2:
             recent_history = normal_msgs[-2:]

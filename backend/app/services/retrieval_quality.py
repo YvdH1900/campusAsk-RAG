@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class RetrievalQualityFilter:
     """检索质量过滤器"""
 
-    HIGH_THRESHOLD = 0.45  # 高质量阈值（优先使用）
+    HIGH_THRESHOLD = 0.30  # 高质量阈值（优先使用）
     LOW_THRESHOLD = 0.15   # 降级阈值（结果不足时使用）
     MIN_RESULTS_COUNT = 3  # 最少保留结果数量
     MIN_CONTENT_LENGTH = 20  # 最低内容长度（字符）
@@ -94,7 +94,7 @@ class RetrievalQualityFilter:
         
         for result in results:
             # 1. 相似度过滤
-            score = result.get("score", 0)
+            score = result.get("rerank_score") or result.get("score", 0)
             if score < threshold:
                 continue
             

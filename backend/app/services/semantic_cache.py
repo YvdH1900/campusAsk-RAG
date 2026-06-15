@@ -23,7 +23,7 @@ class SemanticCacheService:
     """语义缓存服务"""
 
     CACHE_PREFIX = "semantic_cache:"
-    SIMILARITY_THRESHOLD = 0.95  # 相似度阈值
+    SIMILARITY_THRESHOLD = 0.82  # 相似度阈值
     MAX_CACHE_SIZE = 1000  # 最大缓存条目数
 
     def __init__(self):

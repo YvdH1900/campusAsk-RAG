@@ -19,7 +19,7 @@ class VectorConsistencyChecker:
     def __init__(self):
         self.vector_store = VectorStore()
     
-    def check_consistency(self, db: Session) -> Dict:
+    def check_consistency(self, db: Session) -> Dict:#检查数据库与向量库的一致性
         """
         检查数据库与向量库的一致性
         
@@ -55,7 +55,7 @@ class VectorConsistencyChecker:
             orphan_vectors = vector_doc_ids - db_doc_ids  # 向量库中有但数据库中没有
             missing_vectors = db_doc_ids - vector_doc_ids  # 数据库中有但向量库中没有
             
-            result = {
+            result = {#检查结果字典
                 "status": "success",
                 "total_entities": total_entities,
                 "db_document_count": len(db_doc_ids),
@@ -91,7 +91,7 @@ class VectorConsistencyChecker:
             return 0
         
         try:
-            deleted_count = self.vector_store.delete_orphan_vectors()
+            deleted_count = self.vector_store.delete_orphan_vectors()#删除孤儿向量
             logger.info(f"孤儿向量清理完成，删除了 {deleted_count} 条")
             return deleted_count
         except Exception as e:

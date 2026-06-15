@@ -84,6 +84,11 @@ class VectorStore:
             except ValueError:
                 logger.warning(f"环境变量 EMBEDDING_DIMENSION 值无效: {env_dimension}")
         
+        # 从配置读取
+        if hasattr(settings, "EMBEDDING_DIMENSION") and settings.EMBEDDING_DIMENSION:
+            logger.info(f"从配置读取向量维度: {settings.EMBEDDING_DIMENSION}")
+            return settings.EMBEDDING_DIMENSION
+        
         # 使用默认维度
         logger.info(f"使用默认向量维度: {self.DEFAULT_DIMENSION}")
         return self.DEFAULT_DIMENSION
@@ -417,22 +422,22 @@ class VectorStore:
 
     def delete_orphan_vectors(self):
         """删除所有 document_id 无效（0 或 null）的孤儿向量"""
-        self._check_available()
-        self.child_collection.load()
+        self._check_available()#检查向量库是否可用
+        self.child_collection.load()#加载子集合
         try:
             # 查询所有有效向量（document_id > 0）
             valid_results = self.child_collection.query(
                 expr="document_id > 0",
                 output_fields=["id", "document_id"]
             )
-            valid_ids = set(r["id"] for r in valid_results)
+            valid_ids = set(r["id"] for r in valid_results)#有效向量ID集合
             
             # 查询所有无效向量（document_id <= 0 或 null）
             orphan_results = self.child_collection.query(
                 expr="document_id <= 0",
                 output_fields=["id"]
             )
-            orphan_ids = [r["id"] for r in orphan_results]
+            orphan_ids = [r["id"] for r in orphan_results]#无效向量ID列表
             
             if not orphan_ids:
                 logger.info("没有孤儿向量，无需清理")
@@ -441,15 +446,15 @@ class VectorStore:
             logger.info(f"发现 {len(orphan_ids)} 条孤儿向量，开始清理...")
             
             # 分批删除孤儿向量
-            batch_size = 100
-            deleted = 0
+            batch_size = 100#分批删除的向量数量
+            deleted = 0#已删除的向量数量
             for i in range(0, len(orphan_ids), batch_size):
-                batch = orphan_ids[i:i+batch_size]
+                batch = orphan_ids[i:i+batch_size]#当前批次的无效向量ID列表
                 delete_expr = f"id in {batch}"
-                self.child_collection.delete(delete_expr)
+                self.child_collection.delete(delete_expr)#删除当前批次的无效向量
                 deleted += len(batch)
             
-            self.child_collection.flush()
+            self.child_collection.flush()#刷新向量库，确保删除生效
             
             # 验证清理结果
             remaining_orphans = self.child_collection.query(

@@ -10,6 +10,7 @@
 import logging
 import re
 from typing import List, Dict, Optional
+import jieba
 
 logger = logging.getLogger(__name__)
 
@@ -110,18 +111,23 @@ class AnswerVerifier:
             ai_confidence=ai_result.get("confidence", None),
         )
 
-        # 判断标准：优先信任 AI 验证结果
+        # 企业级判断标准：多级置信度，而非二元判断
+        # 只有置信度很低时才标记为无效
         if ai_use_ai and ai_result:
-            # 有 AI 验证时，以 AI 判断为准
-            is_valid = ai_result.get("is_valid", True)
+            # 有 AI 验证时，结合 AI 置信度和规则判断
+            ai_confidence = ai_result.get("confidence", 0.5)
+            # AI 置信度低于 0.4 且规则判断也不通过时，才标记为无效
+            is_valid = not (ai_confidence < 0.4 and confidence < 0.4)
         else:
-            # 无 AI 验证时，用规则判断
-            is_valid = confidence >= 0.5 and context_coverage >= self.min_context_coverage
+            # 无 AI 验证时，用规则判断（降低阈值避免过度拦截）
+            is_valid = confidence >= 0.35
 
         logger.info(
             f"答案验证 (模型={model_name}): 置信度={confidence:.2f}, "
             f"上下文覆盖率={context_coverage:.2%}, "
-            f"问题数={len(issues)}"
+            f"问题数={len(issues)}, "
+            f"AI置信度={ai_result.get('confidence', 'N/A')}, "
+            f"结果={'通过' if is_valid else '不通过'}"
         )
 
         return {
@@ -172,16 +178,22 @@ class AnswerVerifier:
                 lines = [l.strip() for l in content.split("\n") if l.strip()]
                 
                 # 第一行：是否基于上下文
-                is_based = False
+                is_based = None  # None 表示解析失败，使用默认值
                 if lines:
                     first = lines[0].replace("：", "").replace(":", "").strip()
-                    is_based = first.startswith("是")
+                    if first.startswith("是") or "基于" in first or "准确" in first or "合理" in first:
+                        is_based = True
+                    elif first.startswith("否") or "不基于" in first or "不准确" in first:
+                        is_based = False
                 
                 # 第二行：是否有未提及的信息
-                has_extra = True
+                has_extra = None
                 if len(lines) >= 2:
                     second = lines[1].replace("：", "").replace(":", "").strip()
-                    has_extra = second.startswith("有")
+                    if second.startswith("有") or "包含" in second or "超出" in second:
+                        has_extra = True
+                    elif second.startswith("无") or "未包含" in second or "没有" in second:
+                        has_extra = False
                 
                 # 第三行：理由
                 reason = ""
@@ -190,10 +202,24 @@ class AnswerVerifier:
                 else:
                     reason = content[:100]
                 
-                confidence = 0.9 if is_based and not has_extra else 0.3
+                # 解析失败时，默认答案无效（系统准确性优先）
+                if is_based is None:
+                    logger.warning(f"AI 验证解析失败，内容: {content[:100]}")
+                    is_based = False  # 默认无效，确保系统准确性
+                    has_extra = True  # 默认可能有额外信息
+                
+                # 计算 AI 置信度：基于 is_based 和 has_extra 的组合
+                if is_based and not has_extra:
+                    confidence = 0.9
+                elif is_based and has_extra:
+                    confidence = 0.7  # 基于上下文但有额外信息
+                elif not is_based and not has_extra:
+                    confidence = 0.4  # 不基于上下文但没有额外信息
+                else:
+                    confidence = 0.2  # 不基于上下文且有额外信息
                 
                 return {
-                    "is_valid": is_based and not has_extra,
+                    "is_valid": is_based,
                     "confidence": confidence,
                     "reason": reason,
                 }
@@ -230,12 +256,12 @@ class AnswerVerifier:
 
         total_context_lower = total_context.lower()
 
-        # 提取答案中的关键短语（3-gram）
+        # 提取答案中的关键短语（使用 jieba 分词，支持中文）
         answer_phrases = set()
-        words = answer_lower.split()
+        words = list(jieba.cut(answer_lower))
         for i in range(len(words) - 2):
-            phrase = " ".join(words[i:i+3])
-            if len(phrase) > 10:  # 过滤太短的短语
+            phrase = "".join(words[i:i+3])
+            if len(phrase) >= 4:  # 过滤太短的短语
                 answer_phrases.add(phrase)
 
         if not answer_phrases:

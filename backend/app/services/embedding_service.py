@@ -77,6 +77,11 @@ class EmbeddingService:
             except ValueError:
                 pass
 
+        # Check config.py
+        from app.core.config import settings
+        if hasattr(settings, "EMBEDDING_DIMENSION") and settings.EMBEDDING_DIMENSION:
+            return settings.EMBEDDING_DIMENSION
+
         return None
 
     def _get_cache_key(self, text: str, model_name: str, dimension: int | None) -> str:

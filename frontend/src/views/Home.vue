@@ -159,7 +159,7 @@
                       {{ rerankMethodLabel(message.features.rerank_method) }}
                     </span>
                   </div>
-                  <div v-if="message.tokenUsage" class="token-usage">
+                  <div v-if="message.tokenUsage && message.tokenUsage.total_tokens" class="token-usage">
                     <span>Token: {{ message.tokenUsage.total_tokens }}</span>
                     <span class="token-detail">(输入 {{ message.tokenUsage.input_tokens }} / 输出 {{ message.tokenUsage.output_tokens }})</span>
                   </div>

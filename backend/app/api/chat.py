@@ -120,6 +120,11 @@ def ask_question(
     - 多轮对话上下文
     - 流式输出（可选）
     """
+    # 输入验证
+    if not request.content or not request.content.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="问题内容不能为空")
+    if len(request.content) > 2000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="问题内容不能超过2000字")
     # 检查用户状态
     if not current_user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户已被禁用")
@@ -238,6 +243,11 @@ def ask_question_stream(
     
     逐步返回生成的文本，提升用户体验
     """
+    # 输入验证
+    if not request.content or not request.content.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="问题内容不能为空")
+    if len(request.content) > 2000:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="问题内容不能超过2000字")
     # 检查用户状态
     if not current_user.is_active:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户已被禁用")
@@ -628,6 +638,149 @@ def get_quick_questions(
     return [row.content for row in results]
 
 
+@router.get("/feature-status")
+def get_feature_status(
+    db: Session = Depends(get_db)
+):
+    """
+    获取当前功能启用状态（无需认证）
+    """
+    from app.models import ModelConfig, SystemSetting
+
+    def get_setting(key: str, default: str = "false") -> str:
+        setting = db.query(SystemSetting).filter(
+            SystemSetting.setting_key == key
+        ).first()
+        return setting.setting_value if setting else default
+
+    # 获取 LLM 模型配置
+    active_llm = db.query(ModelConfig).filter(
+        ModelConfig.model_type == "llm",
+        ModelConfig.is_active == True
+    ).first()
+    llm_configured = active_llm is not None
+
+    # 获取 Reranker 模型配置
+    active_reranker = db.query(ModelConfig).filter(
+        ModelConfig.model_type == "reranker",
+        ModelConfig.is_active == True
+    ).first()
+    reranker_configured = active_reranker is not None
+
+    query_expansion_enabled = get_setting("query_expansion_enabled", "false") == "true"
+    answer_verification_enabled = get_setting("answer_verification_enabled", "false") == "true"
+    conversation_summary_enabled = get_setting("conversation_summary_enabled", "true") == "true"
+    reranking_enabled = get_setting("reranking_enabled", "true") == "true"
+
+    return {
+        "query_expansion": {
+            "enabled": query_expansion_enabled,
+            "llm_available": llm_configured,
+            "active": query_expansion_enabled and llm_configured,
+        },
+        "conversation_summary": {
+            "enabled": conversation_summary_enabled,
+            "llm_available": llm_configured,
+            "active": conversation_summary_enabled and llm_configured,
+        },
+        "answer_verification": {
+            "enabled": answer_verification_enabled,
+            "llm_available": llm_configured,
+            "active": answer_verification_enabled and llm_configured,
+        },
+        "reranking": {
+            "enabled": reranking_enabled,
+            "api_available": reranker_configured,
+            "active": reranking_enabled,
+            "model_name": active_reranker.model_name if active_reranker else None,
+        },
+    }
+
+
+def _set_setting(db: Session, key: str, value: str, description: str = ""):
+    """设置系统配置"""
+    from app.models import SystemSetting
+    from datetime import datetime
+    setting = db.query(SystemSetting).filter(
+        SystemSetting.setting_key == key
+    ).first()
+    if setting:
+        setting.setting_value = value
+        setting.updated_at = datetime.now()
+    else:
+        setting = SystemSetting(
+            setting_key=key,
+            setting_value=value,
+            description=description,
+        )
+        db.add(setting)
+    db.commit()
+
+
+@router.post("/feature-toggle")
+def toggle_feature(
+    feature: str,
+    enabled: bool,
+    db: Session = Depends(get_db)
+):
+    """
+    切换功能启用状态（需要认证）
+    """
+    from app.models import ModelConfig
+
+    active_llm = db.query(ModelConfig).filter(
+        ModelConfig.model_type == "llm",
+        ModelConfig.is_active == True
+    ).first()
+    llm_configured = active_llm is not None
+
+    active_reranker = db.query(ModelConfig).filter(
+        ModelConfig.model_type == "reranker",
+        ModelConfig.is_active == True
+    ).first()
+    reranker_configured = active_reranker is not None
+
+    if feature == "query_expansion":
+        _set_setting(db, "query_expansion_enabled", str(enabled).lower(), "查询扩展功能开关")
+        return {
+            "feature": feature,
+            "enabled": enabled,
+            "active": enabled and llm_configured,
+            "message": f"查询扩展已{'启用' if enabled else '禁用'}",
+        }
+    elif feature == "answer_verification":
+        _set_setting(db, "answer_verification_enabled", str(enabled).lower(), "答案验证功能开关")
+        return {
+            "feature": feature,
+            "enabled": enabled,
+            "active": enabled and llm_configured,
+            "message": f"答案验证已{'启用' if enabled else '禁用'}",
+        }
+    elif feature == "conversation_summary":
+        _set_setting(db, "conversation_summary_enabled", str(enabled).lower(), "对话摘要功能开关")
+        return {
+            "feature": feature,
+            "enabled": enabled,
+            "active": enabled and llm_configured,
+            "message": f"对话摘要已{'启用' if enabled else '禁用'}",
+        }
+    elif feature == "reranking":
+        _set_setting(db, "reranking_enabled", str(enabled).lower(), "重排序功能开关")
+        return {
+            "feature": feature,
+            "enabled": enabled,
+            "active": enabled,
+            "message": f"重排序已{'启用' if enabled else '禁用'}",
+        }
+    else:
+        return {
+            "feature": feature,
+            "enabled": False,
+            "active": False,
+            "message": f"未知功能: {feature}",
+        }
+
+
 @router.get("/model-info")
 def get_model_info(
     db: Session = Depends(get_db)
@@ -681,4 +834,38 @@ def get_active_announcement(db: Session = Depends(get_db)):
         "is_popup": announcement.is_popup,
         "show_once": announcement.show_once,
         "created_at": announcement.created_at
+    }
+
+
+@router.post("/eval-retrieve")
+def eval_retrieve(
+    request: ChatAskRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """检索评测接口"""
+    from app.services.retrieval_service import RetrievalService
+
+    retrieval_service = RetrievalService()
+    # 检索质量评测：使用数据库配置的完整链路
+    retrieval_service.use_semantic_cache = False
+    retrieval_service.use_quality_filter = True
+    results = retrieval_service.retrieve(
+        question=request.content,
+        top_k=request.top_k,
+        db=db,
+        use_expansion=False,
+        user_role=current_user.role.value if current_user else None,
+    )
+
+    return {
+        "results": [
+            {
+                "content": r.get("child_content", "") or r.get("parent_content", "") or r.get("content", ""),
+                "source": r.get("source", ""),
+                "score": r.get("score", 0.0),
+                "document_id": r.get("document_id", 0),
+            }
+            for r in results
+        ]
     }

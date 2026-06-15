@@ -1167,7 +1167,16 @@ def rebuild_vector_store(task_id: str, config_id: int, model_name: str, api_key:
         total_docs = len(documents)
 
         if total_docs == 0:
-            progress_store.complete_task(task_id, "没有需要重建的文档")
+            progress_store.update_task(task_id, 95, "零文档", "没有文档需要重建，直接激活模型配置")
+            db.query(ModelConfig).filter(
+               ModelConfig.model_type == "embedding",
+               ModelConfig.is_active == True
+            ).update({"is_active": False})
+            target_config = db.query(ModelConfig).filter(ModelConfig.id == config_id).first()
+            if target_config:
+               target_config.is_active = True
+               db.commit()
+            progress_store.complete_task(task_id, "没有需要重建的文档，模型配置已激活")
             os.environ["DASHSCOPE_API_KEY"] = original_key
             dashscope.api_key = original_key
             return

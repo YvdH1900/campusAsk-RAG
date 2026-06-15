@@ -16,10 +16,10 @@ class TextSplitter:
 
     def __init__(
         self,
-        parent_chunk_size: int = 800,
-        parent_chunk_overlap: int = 100,
-        child_chunk_size: int = 200,
-        child_chunk_overlap: int = 30,
+        parent_chunk_size: int = 1000,
+        parent_chunk_overlap: int = 200,
+        child_chunk_size: int = 350,
+        child_chunk_overlap: int = 60,
     ):
         """
         初始化父子文本分块器
@@ -46,6 +46,8 @@ class TextSplitter:
             separators=separators,
         )
 
+
+    
     def split(self, text: str) -> List[Dict]:
         """
         将文本分割成父子块
@@ -75,24 +77,20 @@ class TextSplitter:
         if not parent_chunks:
             return []
 
-        # 2. 每个父块再分割成子块
-        result = []
+        chunks = []
         for p_idx, parent_content in enumerate(parent_chunks):
             parent_id = f"p{p_idx}"
-            
             child_chunks = self.child_splitter.split_text(parent_content)
             child_chunks = [chunk.strip() for chunk in child_chunks if chunk.strip()]
-            
             for c_idx, child_content in enumerate(child_chunks):
                 child_id = f"{parent_id}_c{c_idx}"
-                result.append({
+                chunks.append({
                     "parent_id": parent_id,
                     "parent_content": parent_content,
                     "child_id": child_id,
                     "child_content": child_content,
                 })
-
-        return result
+        return chunks
 
     def split_simple(self, text: str) -> List[str]:
         """

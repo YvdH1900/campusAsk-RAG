@@ -7,7 +7,7 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "--cov=app",
-    "--cov-report=html",
+    "--cov-report=html:tests/tmp_test/htmlcov",
     "--cov-report=term-missing",
 ]
 testpaths = [
@@ -23,15 +23,20 @@ python_functions = [
     "test_*",
 ]
 markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "slow: marks tests as slow",
     "integration: marks tests as integration tests",
     "unit: marks tests as unit tests",
     "rag: marks tests as RAG functionality tests",
+    "evaluation: Golden Dataset retrieval quality evaluation",
+    "retrieval: retrieval-only quality evaluation",
+    "generation: generation layer quality evaluation (requires backend running)",
+    "mock: use mock mode, no external services",
+    "real: use real retrieval, requires Milvus + Embedding API",
 ]
-
 # 覆盖率配置
 [tool.coverage.run]
 source = ["app"]
+data_file = "tests/tmp_test/.coverage"
 omit = [
     "*/tests/*",
     "*/__init__.py",
