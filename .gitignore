@@ -41,8 +41,6 @@ dist/
 build/
 *.egg
 *.egg-info/
-dist/
-build/
 
 # 操作系统文件
 .DS_Store
@@ -98,15 +96,27 @@ minio_data/
 
 # 安全扫描产物
 .bandit
+
+# 上传的文档文件（不提交到版本控制）
+backend/uploads/
+
+# 根目录测试 PDF 文件
+*.pdf
+!docs/*.pdf
+
+# Python 缓存
 .mypy_cache/
 .ruff_cache/
 
 # Celery 运行时文件
-celerybeat-schedule.*
-celerybeat.pid
+celerybeat-schedule*
 
-# Nginx 运行时数据（保留 deploy/nginx/ 部署配置）
-nginx/
-!deploy/nginx/
-deploy/nginx/ssl/*
-!deploy/nginx/ssl/.gitkeep
+# 前端
+frontend/dist/
+frontend/node_modules/
+
+# 临时文件
+*.tmp
+*.temp
+*.swp
+*.swo
