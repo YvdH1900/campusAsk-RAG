@@ -45,10 +45,13 @@ class MultiPathRetrieval:
         Returns:
             融合后的检索结果
         """
+        # 扩大检索范围，确保跨子文档覆盖
+        expanded_top_k = max(top_k, 15)
+
         # 1. 三路检索
-        path1_results = self._path_vector(question, top_k * 2, db=db)
-        path2_results = self._path_expanded_vector(question, top_k * 2, db=db)
-        path3_results = self._path_bm25(question, top_k * 2)
+        path1_results = self._path_vector(question, expanded_top_k, db=db)
+        path2_results = self._path_expanded_vector(question, expanded_top_k, db=db)
+        path3_results = self._path_bm25(question, expanded_top_k)
 
         logger.info(
             f"多路召回: 路径1={len(path1_results)}, "
@@ -58,11 +61,17 @@ class MultiPathRetrieval:
         # 2. 使用 RRF 融合
         fused_results = self._rrf_fusion(
             [path1_results, path2_results, path3_results],
-            top_k=top_k,
+            top_k=expanded_top_k,
         )
 
-        logger.info(f"多路召回完成，返回 {len(fused_results)} 条结果")
-        return fused_results
+        # 3. 跨文档多样性增强：确保每个拆分组至少返回 1-2 个 chunk
+        diversified_results = self._ensure_doc_diversity(fused_results, min_per_doc=2)
+
+        # 4. 按 score 重新排序，取 top_k
+        final_results = sorted(diversified_results, key=lambda x: x.get("score", 0), reverse=True)[:top_k]
+
+        logger.info(f"多路召回完成，返回 {len(final_results)} 条结果")
+        return final_results
 
     def _path_vector(self, question: str, top_k: int, db=None) -> List[Dict]:
         """路径1：原始问题向量检索"""
@@ -101,7 +110,7 @@ class MultiPathRetrieval:
             # 从向量库查询所有子块内容
             all_entities = self.vector_store.child_collection.query(
                 expr="document_id > 0",
-                output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content"],
+                output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content", "split_group_id"],
                 limit=10000,
             )
             
@@ -122,6 +131,7 @@ class MultiPathRetrieval:
                         "child_id": entity.get("child_id"),
                         "parent_content": entity.get("parent_content", ""),
                         "child_content": content,
+                        "split_group_id": entity.get("split_group_id") or "",
                     })
 
             if not child_contents:
@@ -146,6 +156,8 @@ class MultiPathRetrieval:
                         "rerank_method": "bm25",
                         "doc_id": doc_id,
                         "parent_id": doc["parent_id"],
+                        "document_id": doc["document_id"],
+                        "split_group_id": doc["split_group_id"],
                     })
             return results
         except Exception as e:
@@ -214,6 +226,60 @@ class MultiPathRetrieval:
                     r["score"] = 1.0
 
         return fused_results
+
+    def _ensure_doc_diversity(
+        self,
+        results: List[Dict],
+        min_per_doc: int = 2,
+    ) -> List[Dict]:
+        """
+        跨文档多样性增强：确保每个拆分组至少返回 min_per_doc 个 chunk
+        
+        当只有一个文档组时，不做限制，返回全部结果。
+        当有多个文档组时，确保每组至少拿到 min_per_doc 个名额，
+        其余名额按分数高低分配。
+        
+        Args:
+            results: RRF 融合后的检索结果
+            min_per_doc: 每个拆分组最少返回的 chunk 数量
+            
+        Returns:
+            增强多样性后的结果列表
+        """
+        if not results:
+            return []
+
+        # 按 split_group_id 分组（空 split_group_id 的视为独立文档）
+        doc_groups = {}
+        for r in results:
+            group_id = r.get("split_group_id") or f"doc_{r.get('document_id', 'unknown')}"
+            doc_groups.setdefault(group_id, []).append(r)
+
+        # 只有一个文档组时，不需要做多样性限制，返回全部结果
+        if len(doc_groups) <= 1:
+            return results
+
+        # 多个文档组：确保每组至少拿到 min_per_doc 个名额
+        num_groups = len(doc_groups)
+        reserved = []
+        used_ids = set()
+
+        for group_id, chunks in doc_groups.items():
+            quota = min(min_per_doc, len(chunks))
+            for c in chunks[:quota]:
+                pid = c.get("parent_id")
+                if pid and pid not in used_ids:
+                    used_ids.add(pid)
+                    reserved.append(c)
+
+        # 剩余名额按分数从高到低填充（跳过已使用的 parent_id）
+        remaining = [
+            r for r in results
+            if r.get("parent_id") not in used_ids
+        ]
+        remaining.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        return reserved + remaining
 
 
 # 全局实例

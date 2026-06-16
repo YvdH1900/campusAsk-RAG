@@ -1,5 +1,5 @@
 """
-文档解析服务（企业级）
+文档解析服务
 ====================
 支持多种文档格式的文本提取：
 1. PDF - 使用 pdfplumber 解析（支持流式按页解析）
@@ -176,19 +176,67 @@ class DocumentParser:
 
     @staticmethod
     def _parse_pdf(file_path: str) -> str:
-        """解析 PDF 文件（带清理：移除页码、年份标记、单字符行、空白行）"""
-        import re
+        """解析 PDF 文件（带清洗：去页眉页脚、页码、控制字符、重复行）"""
         text_parts = []
+        seen_headers: set = set()  # 用于跨页去重页眉页脚
+
         with pdf_open(file_path) as pdf:
             for page in pdf.pages:
                 page_text = page.extract_text()
                 if not page_text:
                     continue
-                page_lines = page_text.split(chr(10))
-                cleaned = [l for l in page_lines if l.strip() and not re.match(r"^\d{1,4}$", l.strip()) and len(l.strip()) > 1]
-                if cleaned:
-                    text_parts.append(chr(10).join(cleaned))
-        return chr(10).join(text_parts)
+
+                page_lines = page_text.split("\n")
+                cleaned_lines = []
+
+                for line in page_lines:
+                    stripped = line.strip()
+
+                    # 1. 跳过空行
+                    if not stripped:
+                        continue
+
+                    # 2. 去除控制字符和不可见字符
+                    stripped = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", stripped).strip()
+                    if not stripped:
+                        continue
+
+                    # 3. 去除纯页码行（多种格式）
+                    if re.match(r"^\d{1,4}$", stripped):
+                        continue
+                    if re.match(r"^[-—]\s*\d{1,4}\s*[-—]$", stripped):
+                        continue
+                    if re.match(r"^第\s*\d{1,4}\s*页$", stripped):
+                        continue
+                    if re.match(r"^\d{1,4}\s*/\s*\d{1,4}$", stripped):
+                        continue
+
+                    # 4. 去除过短的行（单字符、纯标点）
+                    if len(stripped) <= 1:
+                        continue
+
+                    # 5. 去除页眉页脚（短行 + 跨页重复出现）
+                    if len(stripped) < 30:
+                        if stripped in seen_headers:
+                            continue  # 已见过，跳过（页眉/页脚）
+                        seen_headers.add(stripped)
+
+                    # 6. 去除纯数字/纯标点行
+                    if re.match(r"^[\d\s\.\-—、,，。]+$", stripped):
+                        continue
+
+                    cleaned_lines.append(stripped)
+
+                if cleaned_lines:
+                    text_parts.append("\n".join(cleaned_lines))
+
+        full_text = "\n\n".join(text_parts)
+
+        # 最终清理：合并连续空行、去除首尾空白
+        full_text = re.sub(r"\n{3,}", "\n\n", full_text)
+        full_text = full_text.strip()
+
+        return full_text
 
     @staticmethod
     def _parse_pdf_stream(file_path: str, chunk_pages: int) -> Generator[str, None, None]:

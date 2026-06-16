@@ -82,19 +82,59 @@ class RetrievalEvaluator:
     
     def _mock_search(self, question: str, expected_keywords: List[str]) -> List[Dict]:
         """
-        模拟检索：如果问题有关键词期望，则返回模拟结果；
-        否则返回空列表，模拟"文档未上传"的状态。
+        模拟检索：确定性生成部分命中结果，模拟真实 RAG 行为。
+        
+        - 约 20% 的问题完全召不回相关内容（q_len % 5 == 0）
+        - 其余按问题长度分配命中率：短问题 ~80%，长问题 ~40%
+        
+        确定性保证结果可复现。
         """
+        import hashlib
+        
         if not expected_keywords:
             return []
         
-        return [
-            {
-                "score": 0.85,
-                "child_content": "模拟检索结果: " + "，".join(expected_keywords),
-                "parent_content": "模拟父块内容: 上海交通大学学生管理相关规定...",
-            }
-        ]
+        seed = int(hashlib.md5(question.encode()).hexdigest()[:8], 16)
+        q_len = len(question)
+        
+        # 确定性 miss：基于问题长度模 5，确保约 20% 的问题完全召不回
+        if q_len % 5 == 0:
+            return [{
+                "score": 0.40,
+                "child_content": "模拟检索: 未命中相关内容。本章节讨论的是其他管理条款。",
+                "parent_content": "上海交通大学学生手册其他章节...",
+            }]
+        
+        # 根据问题长度分配命中率
+        if q_len < 15:
+            hit_ratio = 0.80
+            num_chunks = 2
+        elif q_len < 25:
+            hit_ratio = 0.60
+            num_chunks = 3
+        else:
+            hit_ratio = 0.40
+            num_chunks = 4
+        
+        n_hit = max(1, int(len(expected_keywords) * hit_ratio))
+        hit_kws = expected_keywords[:n_hit]
+        
+        results = []
+        per_chunk = max(1, len(hit_kws) // num_chunks)
+        for i in range(min(num_chunks, 5)):
+            start = i * per_chunk
+            end = min(start + per_chunk, len(hit_kws))
+            chunk_kws = hit_kws[start:end]
+            if not chunk_kws:
+                break
+            score = round(0.95 - i * 0.12, 2)
+            results.append({
+                "score": score,
+                "child_content": f"Mock#{i+1}: " + "，".join(chunk_kws),
+                "parent_content": f"MockParent#{i+1}: 上海交通大学学生管理规定...",
+            })
+        
+        return results
     
     def _local_api_search(self, question: str) -> List[Dict]:
         """
@@ -167,26 +207,31 @@ class RetrievalEvaluator:
     def _check_relevance(self, chunk: Dict, qa: GoldenQA) -> tuple:
         """
         检查单个 chunk 是否与 QA 相关。
+        仅做严格子串匹配（大小写不敏感），不做模糊/部分匹配。
         返回 (is_relevant, matched_keywords)。
         """
         content = ""
         if isinstance(chunk, dict):
-            content = chunk.get("content", "") or ""
-            content += " " + (chunk.get("child_content", "") or "")
-            content += " " + (chunk.get("parent_content", "") or "")
+            for field in ("content", "child_content", "parent_content", "text"):
+                val = chunk.get(field, "")
+                if val:
+                    content += val + " "
         
         content_lower = content.lower()
         
         matched = []
+        
+        # 1. 严格子串匹配 expected_keywords
         for kw in qa.expected_keywords:
             if kw.lower() in content_lower:
                 matched.append(kw)
         
-        # 也检查 expected_content
+        # 2. 严格子串匹配 expected_content
         for ec in qa.expected_content:
-            if ec.lower() in content_lower:
+            ec_lower = ec.lower()
+            if ec_lower in content_lower:
                 if ec not in matched:
-                    matched.append(ec[:40])  # 截断显示
+                    matched.append(ec[:40])
         
         is_relevant = len(matched) > 0
         return is_relevant, matched
@@ -215,8 +260,9 @@ class RetrievalEvaluator:
         mrr = 1.0 / first_relevant_rank if first_relevant_rank else 0.0
         
         total_expected = len(qa.expected_keywords) + len(qa.expected_content)
-        # 真正召回率：匹配到的关键词数 / 预期关键词总数
-        keyword_recall = len(all_matched_keywords) / max(total_expected, 1) if total_expected > 0 else 0.0
+        # 召回率：匹配到的预期条目数 / 预期总数（上限 1.0）
+        raw_recall = len(all_matched_keywords) / max(total_expected, 1) if total_expected > 0 else 0.0
+        keyword_recall = min(raw_recall, 1.0)
         # Top-K 精准率：含关键词的chunk数 / 返回的chunk总数
         topk_precision = relevant_count / max(retrieved_count, 1) if retrieved_count > 0 else 0.0
         
@@ -230,8 +276,13 @@ class RetrievalEvaluator:
         
         is_hit = relevant_count > 0
         
-        # Pass判定: top-k 中至少命中一个预期关键词/内容
-        passed = is_hit
+        # Pass判定: 至少命中 2 个预期条目 或 命中率 >= 50%
+        total_expected_items = len(qa.expected_keywords) + len(qa.expected_content)
+        if total_expected_items <= 2:
+            passed = is_hit  # 预期条目少时，命中1个即通过
+        else:
+            min_required = max(2, int(total_expected_items * 0.5))
+            passed = len(all_matched_keywords) >= min_required
         
         return EvaluationResult(
             question=qa.question,
@@ -277,13 +328,19 @@ class RetrievalEvaluator:
         print(f"  至少命中1条: {hit}/{total} ({hit/total*100:.1f}%)")
         print()
         
-        # 按难度统计
+        # 按难度统计详细指标
         for diff in ["easy", "medium", "hard"]:
             diff_results = [r for r in results if r.difficulty == diff]
             if diff_results:
+                d_total = len(diff_results)
                 d_passed = sum(1 for r in diff_results if r.passed)
                 d_hit = sum(1 for r in diff_results if r.is_hit)
-                print(f"  [{diff.upper()}] {len(diff_results)} 题 - 通过 {d_passed}/{len(diff_results)}")
+                d_recall = sum(r.recall for r in diff_results) / d_total
+                d_precision = sum(r.precision for r in diff_results) / d_total
+                d_mrr = sum(r.mrr for r in diff_results) / d_total
+                print(f"  [{diff.upper()}] {d_total}题 | 通过:{d_passed}/{d_total}({d_passed/d_total*100:.0f}%)"
+                      f" | 命中:{d_hit}/{d_total}({d_hit/d_total*100:.0f}%)"
+                      f" | recall={d_recall:.3f} precision={d_precision:.3f} MRR={d_mrr:.3f}")
         
         print()
         

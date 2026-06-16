@@ -140,6 +140,92 @@ class RetrievalService:
             self.bm25_service.build_index(contents)
             self._bm25_built = True
 
+    def _expand_split_group(
+        self,
+        hybrid_results: List[Dict],
+        top_k: int,
+        query_embedding: Optional[List[float]] = None,
+    ) -> List[Dict]:
+        """
+        拆分组扩展：当检索结果命中拆分文档时，补充同源其他文档的上下文
+        
+        Args:
+            hybrid_results: 混合检索结果
+            top_k: 目标结果数量
+            query_embedding: 查询向量（用于向量检索排序）
+            
+        Returns:
+            扩展结果列表
+        """
+        # 收集已命中的拆分组和文档ID
+        split_groups = set()
+        hit_doc_ids = set()
+        
+        for r in hybrid_results:
+            sg = r.get("split_group_id")
+            if sg:
+                split_groups.add(sg)
+            did = r.get("document_id")
+            if did:
+                hit_doc_ids.add(did)
+        
+        if not split_groups:
+            return []
+        
+        # 对每个拆分组，查询同源其他文档的内容
+        expanded = []
+        remaining_slots = max(0, top_k - len(hybrid_results))
+        
+        if remaining_slots <= 0:
+            return []
+        
+        for sg in split_groups:
+            sg_results = self.vector_store.search_by_split_group(
+                split_group_id=sg,
+                query_embedding=query_embedding,
+                top_k=remaining_slots,
+                exclude_document_ids=list(hit_doc_ids),
+            )
+            expanded.extend(sg_results)
+            remaining_slots -= len(sg_results)
+            if remaining_slots <= 0:
+                break
+        
+        if expanded:
+            logger.info(f"拆分组扩展: 补充了 {len(expanded)} 条同源文档结果")
+        
+        return expanded
+
+    def _merge_and_dedup(
+        self,
+        original_results: List[Dict],
+        expanded_results: List[Dict],
+        top_k: int,
+    ) -> List[Dict]:
+        """
+        合并原始结果和扩展结果，按 parent_id 去重
+        
+        Args:
+            original_results: 原始检索结果
+            expanded_results: 扩展结果（已有向量检索评分）
+            top_k: 返回结果数量上限
+            
+        Returns:
+            合并去重后的结果
+        """
+        seen_parent_ids = set(r.get("parent_id") for r in original_results)
+        merged = list(original_results)
+        
+        for item in expanded_results:
+            pid = item.get("parent_id")
+            if pid not in seen_parent_ids:
+                seen_parent_ids.add(pid)
+                merged.append(item)
+        
+        # 按评分重新排序后截断
+        merged.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return merged[:top_k]
+
     def _hybrid_search(
         self,
         query: str,
@@ -321,6 +407,12 @@ class RetrievalService:
                 self._last_expansion_method = "none"
             logger.info(f"扩展查询: '{question}' -> '{retrieval_query}'")
 
+        # 4.5 获取查询向量（用于拆分组扩展检索）
+        query_embedding = self.embedder.embed(retrieval_query, db=db)
+        if not query_embedding:
+            logger.warning("问题向量化失败")
+            return []
+
         # 5. 多路召回或单路检索
         if self.use_multi_path and dynamic_top_k >= 5:
             logger.info("使用多路召回策略")
@@ -331,11 +423,6 @@ class RetrievalService:
             )
         else:
             # 单路检索
-            query_embedding = self.embedder.embed(question, db=db)
-            if not query_embedding:
-                logger.warning("问题向量化失败")
-                return []
-
             candidate_k = dynamic_top_k * 2
             vector_results = self.vector_store.search(
                 query_embedding=query_embedding,
@@ -346,7 +433,13 @@ class RetrievalService:
             logger.info("未检索到相关文档")
             return []
 
-        # 6. 混合检索（向量 + BM25 + 重排序）
+        # 6. 拆分组扩展：在重排序前补充同源拆分子文档的候选 chunk，
+        #    让 Reranker 看到完整候选集，公平评估跨部分内容的相关性
+        expanded_results = self._expand_split_group(vector_results, dynamic_top_k, query_embedding=query_embedding)
+        if expanded_results:
+            vector_results = self._merge_and_dedup(vector_results, expanded_results, dynamic_top_k * 2)
+
+        # 7. 混合检索（向量 + BM25 + 重排序）—— 此时候选池已包含同源文档
         hybrid_results = self._hybrid_search(
             query=retrieval_query,
             vector_results=vector_results,
@@ -357,7 +450,7 @@ class RetrievalService:
         if not hybrid_results:
             return []
 
-        # 7. 质量过滤
+        # 8. 质量过滤
         if self.use_quality_filter:
             hybrid_results = quality_filter.filter(hybrid_results)
             
@@ -366,7 +459,7 @@ class RetrievalService:
                 logger.info("过滤后结果不足，触发扩展检索")
                 # 可以降低阈值重试，这里简单返回现有结果
 
-        # 8. 权限过滤
+        # 9. 权限过滤
         if user_role:
             hybrid_results = permission_filter.filter_by_role(
                 hybrid_results,
@@ -389,11 +482,14 @@ class RetrievalService:
 
             results.append({
                 "content": item.get("parent_content", ""),
+                "child_content": item.get("child_content", ""),
+                "parent_content": item.get("parent_content", ""),
                 "source": doc_cache.get(doc_id, "未知文档"),
                 "score": item.get("score", 0),
                 "document_id": doc_id,
                 "vector_score": item.get("vector_score", 0),
                 "bm25_score": item.get("bm25_score", 0),
+                "split_group_id": item.get("split_group_id") or "",
             })
 
         # 10. 写入缓存

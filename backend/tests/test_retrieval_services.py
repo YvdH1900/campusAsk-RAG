@@ -106,7 +106,7 @@ class TestVectorStore:
     def test_search_empty_embedding(self, vector_store):
         """测试空向量搜索"""
         empty_embedding = []
-        
+
         # 空向量应该返回空结果（VectorStore 内部会处理空向量）
         try:
             results = vector_store.search(empty_embedding, top_k=5)
@@ -114,6 +114,43 @@ class TestVectorStore:
         except Exception:
             # 某些情况下空向量可能抛出异常，这也是可接受的行为
             assert True
+
+    def test_search_by_split_group_returns_results(self, vector_store):
+        """测试按拆分组检索能返回结果（大文档分割场景）"""
+        query_embedding = [0.1] * 1024
+
+        # 先搜索获取一个有 split_group_id 的结果
+        results = vector_store.search(query_embedding, top_k=20)
+
+        # 找到有 split_group_id 的结果
+        split_groups = [r for r in results if r.get("split_group_id")]
+        if split_groups:
+            sg = split_groups[0]["split_group_id"]
+            exclude_ids = [r["document_id"] for r in split_groups[:1]]
+
+            sg_results = vector_store.search_by_split_group(
+                split_group_id=sg,
+                query_embedding=query_embedding,
+                top_k=5,
+                exclude_document_ids=exclude_ids,
+            )
+
+            assert isinstance(sg_results, list)
+            for r in sg_results:
+                assert r.get("split_group_id") == sg
+                assert r.get("document_id") not in exclude_ids
+
+    def test_search_by_split_group_empty_group(self, vector_store):
+        """测试空拆分组返回空"""
+        query_embedding = [0.1] * 1024
+
+        results = vector_store.search_by_split_group(
+            split_group_id="nonexistent_group_12345",
+            query_embedding=query_embedding,
+            top_k=5,
+        )
+
+        assert results == []
 
 
 class TestBM25Service:
@@ -385,14 +422,46 @@ class TestMultiPathRetrieval:
     def test_retrieve_handles_empty_paths(self, multi_path, sample_questions):
         """测试处理空路径"""
         question = sample_questions[0]
-        
+
         with patch.object(multi_path, '_path_vector', return_value=[]), \
              patch.object(multi_path, '_path_expanded_vector', return_value=[]), \
              patch.object(multi_path, '_path_bm25', return_value=[]):
-            
+
             results = multi_path.retrieve(question, top_k=5)
-            
+
             assert results == []
+
+    # ---- 大文档分割多样性测试 ----
+
+    def test_doc_diversity_multi_group(self, multi_path):
+        """测试多路召回的文档多样性策略（大文档分割场景）"""
+        results = [
+            {"parent_id": "p0", "split_group_id": "group_A", "score": 0.9},
+            {"parent_id": "p1", "split_group_id": "group_A", "score": 0.8},
+            {"parent_id": "p2", "split_group_id": "group_A", "score": 0.7},
+            {"parent_id": "p3", "split_group_id": "group_B", "score": 0.6},
+            {"parent_id": "p4", "split_group_id": "group_B", "score": 0.5},
+        ]
+
+        diversified = multi_path._ensure_doc_diversity(results, min_per_doc=2)
+
+        group_a = [r for r in diversified if r.get("split_group_id") == "group_A"]
+        group_b = [r for r in diversified if r.get("split_group_id") == "group_B"]
+        assert len(group_a) >= 1
+        assert len(group_b) >= 1
+
+    def test_doc_diversity_low_relevance_group(self, multi_path):
+        """测试低相关组的多样性策略（只取1个）"""
+        results = [
+            {"parent_id": "p0", "split_group_id": "group_A", "score": 0.9},
+            {"parent_id": "p1", "split_group_id": "group_A", "score": 0.8},
+            {"parent_id": "p2", "split_group_id": "group_B", "score": 0.3},
+        ]
+
+        diversified = multi_path._ensure_doc_diversity(results, min_per_doc=2)
+
+        group_b = [r for r in diversified if r.get("split_group_id") == "group_B"]
+        assert len(group_b) == 1
 
 
 class TestRetrievalService:
@@ -530,14 +599,148 @@ class TestRetrievalService:
     def test_retrieve_handles_errors(self, retrieval_service, sample_questions):
         """测试错误传播（多路召回异常向上抛出）"""
         question = sample_questions[0]
-        
+
         with patch.object(retrieval_service, '_get_cache_key', return_value="test:key"), \
              patch('app.services.cache_service.cache_service.get', return_value=None), \
              patch('app.services.retrieval_service.multi_path_retrieval.retrieve',
                    side_effect=Exception("检索失败")):
-            
+
             with pytest.raises(Exception, match="检索失败"):
                 retrieval_service.retrieve(question, top_k=5)
+
+    # ---- 大文档分割检索测试 ----
+
+    @staticmethod
+    def _make_mock_result(doc_id, parent_id, split_group_id, score, content="测试内容"):
+        """构造模拟检索结果"""
+        return {
+            "document_id": doc_id,
+            "parent_id": parent_id,
+            "child_id": f"{parent_id}_c0",
+            "parent_content": content,
+            "child_content": content,
+            "split_group_id": split_group_id,
+            "score": score,
+        }
+
+    def test_expand_split_group_merges_correctly(self, retrieval_service):
+        """测试拆分组扩展合并逻辑（大文档分割场景）"""
+        original = [
+            self._make_mock_result(1, "p0", "group_A", 0.9, "内容A1"),
+            self._make_mock_result(1, "p1", "group_A", 0.8, "内容A2"),
+        ]
+
+        expanded = [
+            self._make_mock_result(2, "p2", "group_A", 0.7, "内容A3"),
+            self._make_mock_result(3, "p3", "group_A", 0.6, "内容A4"),
+        ]
+
+        merged = retrieval_service._merge_and_dedup(original, expanded, top_k=5)
+
+        assert len(merged) <= 5
+        parent_ids = [r["parent_id"] for r in merged]
+        assert "p0" in parent_ids
+        assert "p1" in parent_ids
+
+    def test_expand_split_group_dedup(self, retrieval_service):
+        """测试拆分组扩展去重"""
+        original = [
+            self._make_mock_result(1, "p0", "group_A", 0.9, "内容A1"),
+        ]
+
+        expanded = [
+            self._make_mock_result(1, "p0", "group_A", 0.7, "内容A1重复"),
+            self._make_mock_result(2, "p1", "group_A", 0.6, "内容A2"),
+        ]
+
+        merged = retrieval_service._merge_and_dedup(original, expanded, top_k=5)
+
+        p0_count = sum(1 for r in merged if r["parent_id"] == "p0")
+        assert p0_count == 1
+
+    def test_expand_split_group_score_discount(self, retrieval_service):
+        """测试扩展结果评分打折"""
+        original = [
+            self._make_mock_result(1, "p0", "group_A", 0.9, "内容A1"),
+        ]
+
+        expanded = [
+            self._make_mock_result(2, "p1", "group_A", 0.8, "内容A2"),
+        ]
+
+        merged = retrieval_service._merge_and_dedup(original, expanded, top_k=5)
+
+        p1_result = next(r for r in merged if r["parent_id"] == "p1")
+        assert p1_result["score"] == 0.8 * 0.8  # 0.64
+
+    def test_expand_split_group_respects_top_k(self, retrieval_service):
+        """测试合并后不超过 top_k"""
+        original = [
+            self._make_mock_result(1, f"p{i}", "group_A", 0.9 - i * 0.1, f"内容{i}")
+            for i in range(4)
+        ]
+
+        expanded = [
+            self._make_mock_result(2, f"p{i}", "group_A", 0.8 - i * 0.1, f"扩展内容{i}")
+            for i in range(4, 8)
+        ]
+
+        merged = retrieval_service._merge_and_dedup(original, expanded, top_k=5)
+
+        assert len(merged) <= 5
+
+    def test_retrieve_with_split_group_expansion(self, retrieval_service, sample_questions):
+        """测试检索流程中的拆分组扩展"""
+        question = sample_questions[0]
+
+        mock_vector_results = [
+            self._make_mock_result(1, "p0", "test_group_001", 0.85, "奖学金申请条件1"),
+            self._make_mock_result(1, "p1", "test_group_001", 0.80, "奖学金申请条件2"),
+        ]
+
+        with patch.object(retrieval_service.embedder, 'embed', return_value=[0.1] * 1024), \
+             patch.object(retrieval_service.vector_store, 'search', return_value=mock_vector_results), \
+             patch.object(retrieval_service, '_hybrid_search', return_value=mock_vector_results), \
+             patch.object(retrieval_service.vector_store, 'search_by_split_group', return_value=[
+                 self._make_mock_result(2, "p2", "test_group_001", 0.75, "奖学金申请条件3"),
+             ]) as mock_sg_search:
+
+            retrieval_service.retrieve(question, top_k=5)
+
+            mock_sg_search.assert_called_once()
+
+    def test_retrieve_no_expansion_without_split_group(self, retrieval_service, sample_questions):
+        """测试无拆分组时不触发扩展"""
+        question = sample_questions[1]
+
+        mock_results = [
+            self._make_mock_result(1, "p0", "", 0.85, "图书馆开放时间"),
+        ]
+
+        with patch.object(retrieval_service.embedder, 'embed', return_value=[0.1] * 1024), \
+             patch.object(retrieval_service.vector_store, 'search', return_value=mock_results), \
+             patch.object(retrieval_service, '_hybrid_search', return_value=mock_results), \
+             patch.object(retrieval_service.vector_store, 'search_by_split_group', return_value=[]) as mock_sg_search:
+
+            retrieval_service.retrieve(question, top_k=5)
+
+            mock_sg_search.assert_not_called()
+
+    def test_merge_preserves_original_order(self, retrieval_service):
+        """测试合并后原始结果按评分排序"""
+        original = [
+            self._make_mock_result(1, "p0", "group_A", 0.9, "高相关"),
+            self._make_mock_result(1, "p1", "group_A", 0.7, "中相关"),
+        ]
+
+        expanded = [
+            self._make_mock_result(2, "p2", "group_A", 0.85, "扩展高相关"),
+        ]
+
+        merged = retrieval_service._merge_and_dedup(original, expanded, top_k=5)
+
+        scores = [r["score"] for r in merged]
+        assert scores == sorted(scores, reverse=True)
 
 
 if __name__ == "__main__":

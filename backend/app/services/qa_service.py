@@ -171,6 +171,69 @@ class QAService:
         
         raise RuntimeError(f"LLM 调用失败，已重试 {self.max_retries} 次: {last_error}")
 
+    def _merge_cross_document_context(self, contexts: List[Dict]) -> List[Dict]:
+        """
+        跨子文档上下文合并：同源子文档的 chunk 合并为完整上下文
+        
+        企业级策略：大文件拆分成多个子文档后，用户问题可能涉及多个部分的内容。
+        此方法检测检索结果中来自同一原文档的多个子文档 chunk，
+        将它们的 parent_content 合并，确保 LLM 看到完整的跨部分上下文。
+        
+        Args:
+            contexts: 检索到的上下文列表
+            
+        Returns:
+            合并后的上下文列表
+        """
+        if not contexts:
+            return contexts
+
+        # 按 split_group_id 分组
+        doc_groups = {}
+        for ctx in contexts:
+            group_id = ctx.get("split_group_id") or f"doc_{ctx.get('document_id', 'unknown')}"
+            doc_groups.setdefault(group_id, []).append(ctx)
+
+        # 如果所有 chunk 都来自不同文档，无需合并
+        if len(doc_groups) <= 1:
+            return contexts
+
+        merged_contexts = []
+        for group_id, group_chunks in doc_groups.items():
+            if len(group_chunks) == 1:
+                # 只有一个 chunk，无需合并
+                merged_contexts.append(group_chunks[0])
+            else:
+                # 多个 chunk 来自同一原文档，合并 parent_content
+                # 按 document_id 和 parent_id 去重后合并
+                seen_parents = set()
+                parent_contents = []
+                for ctx in group_chunks:
+                    parent_id = ctx.get("parent_id")
+                    if parent_id and parent_id not in seen_parents:
+                        seen_parents.add(parent_id)
+                        parent_contents.append(ctx.get("parent_content", ""))
+
+                # 构建合并后的上下文
+                merged_content = "\n\n---\n\n".join(parent_contents)
+                merged_ctx = group_chunks[0].copy()
+                merged_ctx["parent_content"] = merged_content
+                merged_ctx["child_content"] = merged_content[:500]  # 保留子块内容用于展示
+                merged_ctx["_merged"] = True
+                merged_ctx["_source_count"] = len(group_chunks)
+                merged_contexts.append(merged_ctx)
+
+        # 按 score 重新排序
+        merged_contexts.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+        if len(doc_groups) > 1:
+            logger.info(
+                f"跨子文档上下文合并: {len(contexts)} 个 chunk -> "
+                f"{len(merged_contexts)} 个合并上下文, 涉及 {len(doc_groups)} 个拆分组"
+            )
+
+        return merged_contexts
+
     def _calculate_confidence(self, contexts: List[Dict]) -> str:
         """
         根据检索结果计算置信度
@@ -334,6 +397,9 @@ class QAService:
             db=db,
             user_role=user_role,
         )
+
+        # 5.5 跨子文档上下文合并：同源子文档的 chunk 合并为完整上下文
+        contexts = self._merge_cross_document_context(contexts)
 
         if not contexts:
             fallback = self._build_fallback_answer(question, [])
@@ -499,6 +565,9 @@ class QAService:
             db=db,
             user_role=user_role,
         )
+        
+        # 3.5 跨子文档上下文合并
+        contexts = self._merge_cross_document_context(contexts)
         sources = list(dict.fromkeys(ctx.get("source", "未知文档") for ctx in contexts))
 
         if not contexts:

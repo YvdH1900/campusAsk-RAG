@@ -5,7 +5,9 @@
 支持自动重试、失败告警、状态追踪、进度更新
 """
 
+import gc
 import logging
+import time
 from celery import shared_task
 from app.core.database import SessionLocal
 from app.models import Document
@@ -22,12 +24,13 @@ logger = logging.getLogger(__name__)
     time_limit=1800,  # 硬超时：30 分钟
     soft_time_limit=1500,  # 软超时：25 分钟
 )
-def process_document_task(self, document_id: int):
+def process_document_task(self, document_id: int, split_files: list = None):
     """
     异步处理文档任务
     
     Args:
         document_id: 文档ID
+        split_files: 拆分后的文件路径列表（大文件拆分时传入，小文件为 None）
     """
     db = SessionLocal()
     try:
@@ -36,10 +39,10 @@ def process_document_task(self, document_id: int):
             logger.error(f"文档不存在：document_id={document_id}")
             return {"status": "failed", "error": "文档不存在"}
         
-        # 检查文档状态，如果已经是失败状态，不再重复处理
-        if document.status == "failed":
-            logger.warning(f"文档已是失败状态，跳过处理：document_id={document_id}, filename={document.filename}")
-            return {"status": "skipped", "reason": "document already failed"}
+        # 检查文档状态，如果已经是失败/已拆分状态，不再重复处理
+        if document.status in ("failed", "split"):
+            logger.warning(f"文档状态为 {document.status}，跳过处理：document_id={document_id}, filename={document.filename}")
+            return {"status": "skipped", "reason": f"document already {document.status}"}
 
         # 进度回调函数
         def progress_callback(current, total, stage):
@@ -54,7 +57,14 @@ def process_document_task(self, document_id: int):
             )
 
         processor = DocumentProcessor()
-        processor.process_document(document, db, progress_callback=progress_callback)
+        
+        if split_files:
+            # 大文件拆分处理：逐个处理拆分文件，所有向量共享同一个 document_id
+            logger.info(f"大文件拆分处理: {document.filename}, {len(split_files)} 个子文件")
+            processor.process_split_document(document, split_files, db, progress_callback=progress_callback)
+        else:
+            # 普通文件处理
+            processor.process_document(document, db, progress_callback=progress_callback)
 
         logger.info(f"文档处理成功: document_id={document_id}, filename={document.filename}")
         return {

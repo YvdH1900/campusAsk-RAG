@@ -117,11 +117,24 @@ class VectorStore:
                 self._available = True
                 logger.info("Milvus 连接成功")
                 return
-            except Exception as e:
+            except MilvusException as e:
                 wait = base_delay ** attempt
                 if attempt < max_retries:
                     logger.warning(
                         f"Milvus 初始化失败（第 {attempt}/{max_retries} 次尝试）: {str(e)}，"
+                        f"{wait}s 后重试..."
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error(
+                        f"Milvus 初始化失败（已重试 {max_retries} 次）: {str(e)}"
+                    )
+                    self._available = False
+            except Exception as e:
+                wait = base_delay ** attempt
+                if attempt < max_retries:
+                    logger.warning(
+                        f"Milvus 初始化异常（第 {attempt}/{max_retries} 次尝试）: {str(e)}，"
                         f"{wait}s 后重试..."
                     )
                     time.sleep(wait)
@@ -154,24 +167,48 @@ class VectorStore:
             )
 
     def _ensure_collection(self):
-        """确保集合存在且维度正确"""
+        """确保集合存在且维度正确，且包含 split_group_id 字段"""
         if utility.has_collection(self._collection_name):
             existing_collection = Collection(self._collection_name)
             schema = existing_collection.schema
+            field_names = [f.name for f in schema.fields]
+            
+            # 检查是否需要重建：维度不匹配 或 缺少 split_group_id 字段 或 字段长度不匹配
+            need_rebuild = False
+            rebuild_reason = ""
+            
             for field in schema.fields:
                 if field.name == "embedding":
                     existing_dim = field.params.get("dim")
                     if existing_dim != self._dimension:
-                        logger.warning(
-                            f"集合维度不匹配: 现有={existing_dim}, 期望={self._dimension}，"
-                            f"自动重建集合（旧维度数据对新模型无效，将被清除）"
-                        )
-                        utility.drop_collection(self._collection_name)
-                        self._create_child_collection()
-                        self.child_collection = Collection(self._collection_name)
-                        self.child_collection.load()
-                        return
+                        need_rebuild = True
+                        rebuild_reason = f"维度不匹配: 现有={existing_dim}, 期望={self._dimension}"
                     break
+            
+            if "split_group_id" not in field_names:
+                need_rebuild = True
+                rebuild_reason = "缺少 split_group_id 字段"
+            
+            # 检查字段长度是否匹配（设置为 65535 后不再需要检查）
+            # 如果旧集合字段长度 < 65535，则重建
+            for field in schema.fields:
+                if field.name in ("parent_content", "child_content"):
+                    existing_max_length = field.params.get("max_length")
+                    if existing_max_length and existing_max_length < 65535:
+                        need_rebuild = True
+                        rebuild_reason = f"字段长度不足: {field.name} 现有={existing_max_length}, 需要 65535"
+                        break
+            
+            if need_rebuild:
+                logger.warning(
+                    f"集合需要重建: {rebuild_reason}，"
+                    f"自动重建集合（旧数据将被清除，需重新处理文档）"
+                )
+                utility.drop_collection(self._collection_name)
+                self._create_child_collection()
+                self.child_collection = Collection(self._collection_name)
+                self.child_collection.load()
+                return
         
         if not utility.has_collection(self._collection_name):
             self._create_child_collection()
@@ -191,13 +228,17 @@ class VectorStore:
 
     def _create_child_collection(self):
         """创建子块集合"""
+        # Milvus VARCHAR 最大支持 65535，设置为最大值避免长度限制问题
+        MAX_VARCHAR_LENGTH = 65535
+        
         fields = [
             FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=100, is_primary=True),
             FieldSchema(name="document_id", dtype=DataType.INT64, description="文档ID"),
             FieldSchema(name="parent_id", dtype=DataType.VARCHAR, max_length=100, description="父块ID"),
             FieldSchema(name="child_id", dtype=DataType.VARCHAR, max_length=100, description="子块ID"),
-            FieldSchema(name="parent_content", dtype=DataType.VARCHAR, max_length=4000, description="父块内容（完整上下文）"),
-            FieldSchema(name="child_content", dtype=DataType.VARCHAR, max_length=2000, description="子块内容（用于检索匹配）"),
+            FieldSchema(name="parent_content", dtype=DataType.VARCHAR, max_length=MAX_VARCHAR_LENGTH, description="父块内容（完整上下文）"),
+            FieldSchema(name="child_content", dtype=DataType.VARCHAR, max_length=MAX_VARCHAR_LENGTH, description="子块内容（用于检索匹配）"),
+            FieldSchema(name="split_group_id", dtype=DataType.VARCHAR, max_length=200, description="拆分组ID（同源子文档共享）"),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self._dimension, description="子块向量"),
         ]
 
@@ -234,6 +275,7 @@ class VectorStore:
         document_id: int,
         chunks: List[Dict],
         embeddings: List[List[float]],
+        split_group_id: Optional[str] = None,
     ) -> List[str]:
         """
         插入子块向量（父块内容内联存储，检索时去重）
@@ -242,6 +284,7 @@ class VectorStore:
             document_id: 文档ID
             chunks: 父子块列表
             embeddings: 子块对应的向量列表
+            split_group_id: 拆分组ID（同源子文档共享）
             
         Returns:
             插入的子块ID列表
@@ -252,17 +295,15 @@ class VectorStore:
         if len(chunks) != len(embeddings):
             raise ValueError(f"向量数量不匹配: chunks={len(chunks)}, embeddings={len(embeddings)}")
 
-        # 过滤掉空向量（对应空文本块）
-        valid_pairs = [
-            (chunk, emb) for chunk, emb in zip(chunks, embeddings)
-            if emb and len(emb) > 0
-        ]
+        # 严格校验：检查是否有空向量（调用方应确保已过滤）
+        empty_count = sum(1 for emb in embeddings if not emb or len(emb) == 0)
+        if empty_count > 0:
+            raise ValueError(
+                f"发现 {empty_count}/{len(embeddings)} 个空向量，"
+                f"调用方应确保传入的 chunks 和 embeddings 已过滤空内容"
+            )
 
-        if not valid_pairs:
-            logger.warning(f"文档 {document_id} 没有有效的向量，跳过插入")
-            return []
-
-        logger.info(f"文档 {document_id}: {len(valid_pairs)}/{len(chunks)} 个有效向量")
+        logger.info(f"文档 {document_id}: {len(chunks)} 个向量待插入")
 
         if not self._available or self.child_collection is None:
             logger.warning("Milvus 不可用，跳过向量插入")
@@ -280,9 +321,9 @@ class VectorStore:
                 return []
 
         child_ids = []
-        child_data = [[], [], [], [], [], [], []]
+        child_data = [[], [], [], [], [], [], [], []]
         
-        for chunk, embedding in valid_pairs:
+        for chunk, embedding in zip(chunks, embeddings):
             child_id = f"doc{document_id}_{chunk['child_id']}"
             child_ids.append(child_id)
             
@@ -290,9 +331,10 @@ class VectorStore:
             child_data[1].append(document_id)
             child_data[2].append(chunk["parent_id"])
             child_data[3].append(chunk["child_id"])
-            child_data[4].append(chunk["parent_content"])
-            child_data[5].append(chunk["child_content"])
-            child_data[6].append(embedding)
+            child_data[4].append(chunk["parent_content"][:8000])
+            child_data[5].append(chunk["child_content"][:4000])
+            child_data[6].append(split_group_id or "")
+            child_data[7].append(embedding)
 
         if child_data[0]:
             self.child_collection.insert(child_data)
@@ -336,7 +378,7 @@ class VectorStore:
             param=search_params,
             limit=top_k,
             expr=expr,
-            output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content"],
+            output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content", "split_group_id"],
         )
 
         output = []
@@ -357,9 +399,114 @@ class VectorStore:
                     "child_id": hit.entity.get("child_id"),
                     "parent_content": hit.entity.get("parent_content"),
                     "child_content": hit.entity.get("child_content"),
+                    "split_group_id": hit.entity.get("split_group_id") or "",
                     "score": hit.distance,
                 })
 
+        return output
+
+    def search_by_split_group(
+        self,
+        split_group_id: str,
+        query_embedding: Optional[List[float]] = None,
+        top_k: int = 5,
+        exclude_document_ids: Optional[List[int]] = None,
+    ) -> List[Dict]:
+        """
+        按拆分组检索（获取同源文档的相关块）
+        
+        用于扩展检索：当某个拆分文档命中时，补充同源其他文档的相关上下文。
+        如果有 query_embedding，使用向量检索排序；否则返回所有子块。
+        
+        Args:
+            split_group_id: 拆分组ID
+            query_embedding: 查询向量（用于向量检索排序，可选）
+            top_k: 返回结果数量
+            exclude_document_ids: 要排除的文档ID列表（已命中的文档）
+            
+        Returns:
+            同源文档的检索结果列表
+        """
+        if not self._available or self.child_collection is None:
+            logger.warning("Milvus 不可用，返回空结果")
+            return []
+        
+        if not split_group_id:
+            return []
+        
+        # 构建基础过滤表达式
+        base_expr = f'split_group_id == "{split_group_id}"'
+        if exclude_document_ids:
+            excluded = ",".join(str(did) for did in exclude_document_ids)
+            base_expr += f" and document_id not in [{excluded}]"
+        
+        # 如果有查询向量，使用向量检索（有相关性排序）
+        if query_embedding:
+            search_params = {
+                "metric_type": "COSINE",
+                "params": {"ef": 64},
+            }
+            
+            results = self.child_collection.search(
+                data=[query_embedding],
+                anns_field="embedding",
+                param=search_params,
+                limit=top_k,
+                expr=base_expr,
+                output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content", "split_group_id"],
+            )
+            
+            output = []
+            seen_parent_ids = set()
+            
+            for hits in results:
+                for hit in hits:
+                    parent_id = hit.entity.get("parent_id")
+                    if parent_id in seen_parent_ids:
+                        continue
+                    seen_parent_ids.add(parent_id)
+                    
+                    output.append({
+                        "document_id": hit.entity.get("document_id"),
+                        "parent_id": parent_id,
+                        "child_id": hit.entity.get("child_id"),
+                        "parent_content": hit.entity.get("parent_content"),
+                        "child_content": hit.entity.get("child_content"),
+                        "split_group_id": hit.entity.get("split_group_id") or "",
+                        "score": hit.distance,
+                    })
+            
+            return output
+        
+        # 无查询向量时，简单查询返回（用于兜底）
+        results = self.child_collection.query(
+            expr=base_expr,
+            output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content", "split_group_id"],
+            limit=1000,
+        )
+        
+        if not results:
+            return []
+        
+        output = []
+        seen_parent_ids = set()
+        
+        for item in results[:top_k]:
+            parent_id = item.get("parent_id")
+            if parent_id in seen_parent_ids:
+                continue
+            seen_parent_ids.add(parent_id)
+            
+            output.append({
+                "document_id": item.get("document_id"),
+                "parent_id": parent_id,
+                "child_id": item.get("child_id"),
+                "parent_content": item.get("parent_content"),
+                "child_content": item.get("child_content"),
+                "split_group_id": item.get("split_group_id") or "",
+                "score": 0.0,
+            })
+        
         return output
 
     def delete_by_document_id(self, document_id: int):

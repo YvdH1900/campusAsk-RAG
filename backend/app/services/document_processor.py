@@ -9,7 +9,9 @@
 - 多语言支持
 """
 
+import gc
 import logging
+import os
 from typing import Optional, Callable
 from sqlalchemy.orm import Session
 from app.models import Document
@@ -37,6 +39,133 @@ class DocumentProcessor:
         if self.vector_store is None:
             self.vector_store = VectorStore(db=db)
         return self.vector_store
+
+    def process_split_document(
+        self,
+        document: Document,
+        split_files: list,
+        db: Session,
+        progress_callback: Optional[Callable] = None,
+    ):
+        """
+        处理拆分文档：逐个处理拆分文件，所有向量共享同一个 document_id
+        
+        Args:
+            document: 文档对象
+            split_files: 拆分后的文件路径列表
+            db: 数据库会话
+            progress_callback: 进度回调函数 callback(current, total, stage)
+        """
+        def report_progress(current, total, stage):
+            if progress_callback:
+                progress_callback(current, total, stage)
+            logger.info(f"进度: {stage} - {current}/{total}")
+
+        try:
+            # 更新状态为处理中
+            if document.status in ("pending", "approved"):
+                document.status = "processing"
+                db.commit()
+
+            vector_store = self._get_vector_store(db)
+            total_files = len(split_files)
+            all_valid_chunks = []
+            all_embeddings = []
+
+            for idx, split_path in enumerate(split_files):
+                split_name = os.path.basename(split_path)
+                logger.info(f"处理拆分文件 [{idx+1}/{total_files}]: {split_name}")
+
+                # 1. 解析拆分文件
+                report_progress(idx * 100 // total_files, 100, f"解析文件 {idx+1}/{total_files}")
+                text = self.parser.parse(split_path)
+
+                if not text.strip():
+                    logger.warning(f"拆分文件内容为空，跳过: {split_name}")
+                    continue
+
+                # 2. 文本分块
+                chunks = self.splitter.split(text)
+
+                if not chunks:
+                    logger.warning(f"拆分文件分块后为空，跳过: {split_name}")
+                    continue
+
+                # 过滤空内容
+                valid_chunks = [chunk for chunk in chunks if chunk.get("child_content", "").strip()]
+                if not valid_chunks:
+                    logger.warning(f"拆分文件无有效内容，跳过: {split_name}")
+                    continue
+
+                child_contents = [chunk["child_content"] for chunk in valid_chunks]
+                logger.info(f"拆分文件 {split_name}: {len(valid_chunks)} 个有效子块")
+
+                # 3. 向量化
+                report_progress((idx + 1) * 50 // total_files, 100, f"向量化文件 {idx+1}/{total_files}")
+                embeddings = self.embedder.embed_batch(child_contents, db=db)
+
+                all_valid_chunks.extend(valid_chunks)
+                all_embeddings.extend(embeddings)
+
+                # 清理临时变量
+                del text, chunks, valid_chunks, child_contents, embeddings
+                gc.collect()
+
+            if not all_valid_chunks:
+                raise ValueError("所有拆分文件处理后均无有效内容")
+
+            logger.info(
+                f"拆分文档处理完成: {document.filename}, "
+                f"{total_files} 个子文件, 共 {len(all_valid_chunks)} 个子块"
+            )
+
+            # 4. 存储到向量数据库（所有向量共享同一个 document_id）
+            report_progress(80, 100, "存储向量")
+            try:
+                vector_store.insert(document.id, all_valid_chunks, all_embeddings, split_group_id=document.split_group_id)
+            except Exception as e:
+                logger.error(f"向量入库失败，回滚文档状态: {document.filename}, 错误: {str(e)}")
+                try:
+                    vector_store.delete_by_document_id(document.id)
+                    logger.info(f"已清理文档 {document.id} 的残留向量")
+                except Exception as cleanup_error:
+                    logger.warning(f"清理残留向量失败: {str(cleanup_error)}")
+                document.status = "failed"
+                db.commit()
+                raise
+
+            # 5. 更新状态为完成
+            document.status = "completed"
+            db.commit()
+
+            # 6. 清除缓存
+            cache_service.clear_pattern("search:*")
+            cache_service.clear_pattern(f"document:{document.id}:*")
+
+            # 7. 清理拆分文件
+            for split_path in split_files:
+                try:
+                    os.remove(split_path)
+                    logger.info(f"已清理拆分文件: {split_path}")
+                except Exception:
+                    pass
+
+            report_progress(100, 100, "完成")
+            logger.info(f"拆分文档处理完成: {document.filename}, 共 {len(all_valid_chunks)} 个子块")
+
+            del all_valid_chunks, all_embeddings
+            gc.collect()
+
+        except Exception as e:
+            try:
+                document.status = "failed"
+                db.commit()
+            except Exception as db_error:
+                logger.error(f"更新文档失败状态时出错: {str(db_error)}")
+                db.rollback()
+            
+            logger.error(f"拆分文档处理失败: {document.filename}, 错误: {str(e)}")
+            raise
 
     def process_document(
         self,
@@ -92,10 +221,28 @@ class DocumentProcessor:
             quality = self.splitter.evaluate_quality(chunks)
             logger.info(f"分块质量: {quality}")
 
-            # 提取子块内容用于向量化
-            child_contents = [chunk["child_content"] for chunk in chunks]
-            parent_count = len(set(c["parent_id"] for c in chunks))
-            logger.info(f"文档 {document.filename} 分为 {len(chunks)} 个子块，对应 {parent_count} 个父块")
+            # 质量警告
+            if quality["quality"] == "poor":
+                logger.warning(
+                    f"文档 {document.filename} 分块质量较差: "
+                    f"子块过短({quality['too_short']}/{quality['total_children']}), "
+                    f"子块过长({quality['too_long']}/{quality['total_children']}), "
+                    f"平均子块大小={quality['avg_child_size']}字符"
+                )
+            elif quality["quality"] == "fair":
+                logger.warning(
+                    f"文档 {document.filename} 分块质量一般: "
+                    f"子块过短({quality['too_short']}/{quality['total_children']})"
+                )
+
+            # 提取子块内容用于向量化（过滤空内容）
+            valid_chunks = [chunk for chunk in chunks if chunk.get("child_content", "").strip()]
+            if not valid_chunks:
+                raise ValueError("文档分块后无有效内容")
+            
+            child_contents = [chunk["child_content"] for chunk in valid_chunks]
+            parent_count = len(set(c["parent_id"] for c in valid_chunks))
+            logger.info(f"文档 {document.filename} 分为 {len(chunks)} 个子块（有效 {len(valid_chunks)} 个），对应 {parent_count} 个父块")
 
             report_progress(40, 100, "向量化")
 
@@ -111,7 +258,7 @@ class DocumentProcessor:
             logger.info(f"开始存储向量: {document.filename}")
             vector_store = self._get_vector_store(db)
             try:
-                vector_store.insert(document.id, chunks, all_embeddings)
+                vector_store.insert(document.id, valid_chunks, all_embeddings, split_group_id=document.split_group_id)
             except Exception as e:
                 # 向量入库失败，回滚文档状态并清理可能已插入的向量
                 logger.error(f"向量入库失败，回滚文档状态: {document.filename}, 错误: {str(e)}")
@@ -137,6 +284,10 @@ class DocumentProcessor:
 
             report_progress(100, 100, "完成")
             logger.info(f"文档处理完成: {document.filename}, 共 {len(chunks)} 个子块")
+
+            # 释放临时变量，避免内存累积
+            del text, chunks, child_contents, all_embeddings
+            gc.collect()
 
         except Exception as e:
             # 更新状态为失败

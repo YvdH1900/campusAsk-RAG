@@ -90,9 +90,10 @@ class EmbeddingService:
         return f"embedding:{model_name}:{dim_str}:{text_hash}"
 
     def _call_with_retry(self, texts, model_name, dimension=None, is_batch=False):
+        """调用 Embedding API，带指数退避重试"""
         last_error = None
         if dimension is not None:
-            logger.info(f"调用 Embedding API: model={model_name}, dimension={dimension}")
+            logger.info(f"调用 Embedding API: model={model_name}, dimension={dimension}, texts={len(texts)}")
 
         for attempt in range(self.max_retries):
             try:
@@ -110,8 +111,9 @@ class EmbeddingService:
                 last_error = error_msg
 
             except Exception as e:
-                logger.warning(f"向量化 API 调用异常 (尝试 {attempt + 1}/{self.max_retries}): {str(e)}")
-                last_error = str(e)
+                error_str = str(e)
+                logger.warning(f"向量化 API 调用异常 (尝试 {attempt + 1}/{self.max_retries}): {error_str}")
+                last_error = error_str
 
             if attempt < self.max_retries - 1:
                 delay = self.base_delay * (2 ** attempt)
@@ -149,9 +151,23 @@ class EmbeddingService:
 
     def embed_batch(self, texts: List[str], batch_size: int = 10, db=None,
                     model_name_override: str = None, dimension_override: int = None) -> List[List[float]]:
+        """
+        批量向量化（调用方应确保已过滤空文本）
+        
+        Args:
+            texts: 文本列表（应已过滤空内容）
+            batch_size: 批次大小
+            db: 数据库会话
+            model_name_override: 覆盖模型名称
+            dimension_override: 覆盖向量维度
+            
+        Returns:
+            向量列表，与输入 texts 一一对应
+        """
         model_name = model_name_override or self._get_current_model_name(db)
         dimension = dimension_override if dimension_override is not None else self._get_current_dimension(db)
 
+        # 防御性检查：过滤空文本并记录警告
         valid_texts = []
         original_indices = []
         for i, text in enumerate(texts):
@@ -159,7 +175,7 @@ class EmbeddingService:
                 valid_texts.append(text)
                 original_indices.append(i)
             else:
-                logger.warning(f"跳过空文本块 (索引 {i})")
+                logger.warning(f"跳过空文本块 (索引 {i})，调用方应预先过滤")
 
         if not valid_texts:
             logger.warning("所有文本块均为空，返回空向量列表")
@@ -228,6 +244,7 @@ class EmbeddingService:
                 f"向量化结果数量不匹配: 输入 {len(valid_texts)} 个文本，返回 {len(all_embeddings)} 个向量"
             )
 
+        # 重建完整结果，保持与原始 texts 的索引对应
         full_result = [[] for _ in texts]
         for valid_idx, original_idx in enumerate(original_indices):
             full_result[original_idx] = all_embeddings[valid_idx]

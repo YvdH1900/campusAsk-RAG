@@ -862,6 +862,8 @@ def eval_retrieve(
         "results": [
             {
                 "content": r.get("child_content", "") or r.get("parent_content", "") or r.get("content", ""),
+                "child_content": r.get("child_content", ""),
+                "parent_content": r.get("parent_content", ""),
                 "source": r.get("source", ""),
                 "score": r.get("score", 0.0),
                 "document_id": r.get("document_id", 0),
