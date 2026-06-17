@@ -88,6 +88,7 @@ CREATE TABLE documents (
     description TEXT COMMENT '文档描述',
     status VARCHAR(20) NOT NULL DEFAULT 'pending' COMMENT '处理状态：pending/processing/completed/failed',
     review_status VARCHAR(20) NOT NULL DEFAULT 'pending' COMMENT '审核状态：pending/approved/rejected',
+    split_group_id VARCHAR(100) COMMENT '拆分组ID（同源子文档共享同一ID）',
     reviewed_by INT COMMENT '审核人 ID',
     reviewed_at DATETIME COMMENT '审核时间',
     reject_reason TEXT COMMENT '驳回理由',
