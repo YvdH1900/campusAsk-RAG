@@ -40,7 +40,8 @@ CREATE TABLE users (
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     INDEX idx_username (username),
     INDEX idx_email (email),
-    INDEX idx_role (role)
+    INDEX idx_role (role),
+    INDEX idx_current_session_id (current_session_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='用户表';
 
 -- ================================================
@@ -97,6 +98,7 @@ CREATE TABLE documents (
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
     INDEX idx_status (status),
     INDEX idx_review_status (review_status),
+    INDEX idx_split_group_id (split_group_id),
     INDEX idx_uploaded_by (uploaded_by),
     INDEX idx_created_at (created_at),
     FOREIGN KEY (reviewed_by) REFERENCES users(id) ON DELETE SET NULL,
