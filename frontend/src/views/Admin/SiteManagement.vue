@@ -522,8 +522,13 @@ const currentLlmModelName = ref<string>('')
 const currentEmbeddingModelName = ref<string>('')
 const currentRerankerModelName = ref<string>('')
 
-// 功能启用状态
-const featureStatus = ref<any>({})
+// 功能启用状态（初始化默认值，防止 API 未返回时访问 undefined）
+const featureStatus = ref<any>({
+  query_expansion: { enabled: false, active: false, llm_available: false },
+  conversation_summary: { enabled: false, active: false, llm_available: false },
+  answer_verification: { enabled: false, active: false, llm_available: false },
+  reranking: { enabled: false, active: false, llm_available: false },
+})
 
 const loginRecords = ref<any[]>([])
 
