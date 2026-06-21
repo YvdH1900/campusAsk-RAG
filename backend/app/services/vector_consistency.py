@@ -79,9 +79,13 @@ class VectorConsistencyChecker:
                 "message": str(e)
             }
     
-    def clean_orphan_vectors(self) -> int:
+    def clean_orphan_vectors(self, db: Session = None) -> int:
         """
         清理孤儿向量
+        
+        分两步：
+        1. 删除 document_id <= 0 的无效向量
+        2. 删除 document_id 在 Milvus 中存在但 MySQL 中不存在的向量
         
         Returns:
             清理的向量数量
@@ -91,7 +95,18 @@ class VectorConsistencyChecker:
             return 0
         
         try:
-            deleted_count = self.vector_store.delete_orphan_vectors()#删除孤儿向量
+            deleted_count = self.vector_store.delete_orphan_vectors()
+            
+            # 清理 MySQL 中不存在的 document_id
+            if db:
+                consistency = self.check_consistency(db)
+                orphans = consistency.get("orphan_documents", [])
+                if orphans:
+                    for doc_id in orphans:
+                        self.vector_store.delete_by_document_id(doc_id)
+                        logger.info(f"删除孤儿文档向量: document_id={doc_id}")
+                    deleted_count += len(orphans)
+            
             logger.info(f"孤儿向量清理完成，删除了 {deleted_count} 条")
             return deleted_count
         except Exception as e:
@@ -120,8 +135,15 @@ class VectorConsistencyChecker:
                 logger.warning(f"文档未完成: {document_id}, 状态: {document.status}")
                 return False
             
-            # 2. 删除现有向量
+            # 2. 删除现有向量 + MySQL 父块记录（避免重建时产生重复数据）
             self.vector_store.delete_by_document_id(document_id)
+            from app.models import ParentChunk
+            deleted_mysql = db.query(ParentChunk).filter(
+                ParentChunk.document_id == document_id
+            ).delete()
+            db.commit()
+            if deleted_mysql:
+                logger.info(f"已删除文档 {document_id} 的 {deleted_mysql} 条 MySQL 父块记录")
             
             # 3. 重新处理文档
             from app.services.document_processor import DocumentProcessor

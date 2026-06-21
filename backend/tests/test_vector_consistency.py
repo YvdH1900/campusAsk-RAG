@@ -47,7 +47,7 @@ class TestVectorConsistencyReal:
         db = real_services["db"]
         before = checker.check_consistency(db)
 
-        deleted_count = checker.clean_orphan_vectors()
+        deleted_count = checker.clean_orphan_vectors(db)
 
         assert isinstance(deleted_count, int), "清理数量必须是整数"
         assert deleted_count >= 0, "清理数量不能小于 0"

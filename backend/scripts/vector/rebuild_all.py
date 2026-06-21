@@ -30,6 +30,46 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     logger.info("数据库表创建完成")
 
+    # 兜底迁移：确保后续新增的表/列存在
+    _migrate_parent_chunks_table()
+
+
+def _migrate_parent_chunks_table():
+    """迁移 parent_chunks 表：确保父块存储表存在（兜底保护）"""
+    try:
+        with engine.connect() as conn:
+            from sqlalchemy import text, inspect
+            inspector = inspect(conn)
+            existing_tables = inspector.get_table_names()
+
+            if "parent_chunks" in existing_tables:
+                return
+
+            logger.info("数据库迁移: 创建 parent_chunks 表...")
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS parent_chunks (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    document_id INT NOT NULL COMMENT '文档ID',
+                    parent_id VARCHAR(100) NOT NULL COMMENT '父块ID（如 p0, p1）',
+                    parent_content TEXT NOT NULL COMMENT '父块完整内容',
+                    split_group_id VARCHAR(100) DEFAULT NULL COMMENT '拆分组ID',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                    INDEX idx_document_id (document_id),
+                    INDEX idx_parent_id (parent_id),
+                    INDEX idx_split_group_id (split_group_id),
+                    CONSTRAINT fk_parent_chunks_document
+                        FOREIGN KEY (document_id) REFERENCES documents(id)
+                        ON DELETE CASCADE
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                COMMENT='文档父块存储表（章节级上下文，子块向量存 Milvus）'
+            """))
+            conn.commit()
+            logger.info("数据库迁移: parent_chunks 表创建成功")
+
+    except Exception as e:
+        logger.warning(f"数据库迁移 (parent_chunks表) 失败（可安全忽略）: {e}")
+
 
 def create_default_admin():
     """创建默认管理员账户"""

@@ -126,9 +126,12 @@ class SemanticCacheService:
             return {
                 "answer": best_match.get("answer"),
                 "sources": best_match.get("sources", []),
+                "contexts": best_match.get("contexts", []),  # ← 返回 contexts
                 "context_count": best_match.get("context_count", 0),
                 "confidence": best_match.get("confidence", "高"),
                 "similarity": round(best_score, 4),
+                "features": best_match.get("features", {}),
+                "token_usage": best_match.get("token_usage", {}),
             }
 
         logger.info(f"语义缓存未命中: '{question[:30]}...' (最高相似度: {best_score:.4f})")
@@ -174,8 +177,11 @@ class SemanticCacheService:
             "embedding": embedding,
             "answer": answer_data.get("answer"),
             "sources": answer_data.get("sources", []),
+            "contexts": answer_data.get("contexts", []),  # ← 存储 contexts
             "context_count": answer_data.get("context_count", 0),
             "confidence": answer_data.get("confidence", "高"),
+            "features": answer_data.get("features", {}),
+            "token_usage": answer_data.get("token_usage", {}),
         }
 
         cache_service.set(vector_key, cached_vectors, ttl=86400 * 7)  # 7 天过期

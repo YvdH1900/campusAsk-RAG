@@ -109,7 +109,9 @@ class TestTextSplitter:
         assert splitter.split_simple("") == []
 
     def test_split_small_text(self, splitter):
-        chunks = splitter.split("短文本")
+        # 使用 ≥30 字符的文本，避免被清洗流水线拦截
+        # （min_effective_chars_per_page=30）
+        chunks = splitter.split("这是一个短文本测试用例，用于验证文本分块器对较小文本的正确处理能力。短文本")
         assert len(chunks) >= 1
         assert "短文本" in chunks[0]["parent_content"]
 

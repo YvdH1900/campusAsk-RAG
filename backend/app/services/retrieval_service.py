@@ -31,6 +31,7 @@ from app.services.retrieval_quality import quality_filter
 from app.services.multi_path_retrieval import multi_path_retrieval
 from app.services.permission_filter import permission_filter
 from app.models import Document
+from app.models import ParentChunk
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,6 @@ class RetrievalService:
         self.bm25_service = BM25Service()
         self.reranker = RerankerService()
         self.cache_ttl = 3600  # 检索结果缓存 1 小时
-        self._bm25_built = False
         self.use_multi_path = True  # 是否启用多路召回
         self.use_quality_filter = True  # 是否启用质量过滤
         self.use_semantic_cache = True  # 是否启用语义缓存
@@ -56,8 +56,9 @@ class RetrievalService:
         self._reranker_api_key = None  # AI 重排序 API Key
         self._last_rerank_method = None  # 记录上次使用的重排序方法
         self._full_bm25_built = False  # 全量BM25索引是否已构建
-        self._full_bm25_docs = []       # 全量文档列表
-        self._full_bm25_ids = []       # 全量文档对应的 parent_id 列表
+        self._full_bm25_docs = []       # 全量文档列表（child_content）
+        self._full_bm25_ids = []        # 全量文档对应的 parent_id 列表
+        self._full_bm25_doc_ids = []    # 全量文档对应的 document_id 列表
         self._llm_model_name = None  # LLM 模型名称（用于查询扩展等）
         self._last_expansion_method = None  # 记录上次使用的查询扩展方法
 
@@ -128,18 +129,6 @@ class RetrievalService:
         question_hash = hashlib.md5(question.encode("utf-8")).hexdigest()
         return f"search:{question_hash}"
 
-    def _build_bm25_index(self, contexts: List[Dict]):
-        """
-        构建 BM25 索引（惰性构建）
-        
-        Args:
-            contexts: 文档内容列表
-        """
-        if not self._bm25_built and contexts:
-            contents = [ctx.get("child_content", "") for ctx in contexts]
-            self.bm25_service.build_index(contents)
-            self._bm25_built = True
-
     def _expand_split_group(
         self,
         hybrid_results: List[Dict],
@@ -174,7 +163,7 @@ class RetrievalService:
         
         # 对每个拆分组，查询同源其他文档的内容
         expanded = []
-        remaining_slots = max(0, top_k - len(hybrid_results))
+        remaining_slots = max(0, min(top_k * 2, len(hybrid_results) + 10) - len(hybrid_results))
         
         if remaining_slots <= 0:
             return []
@@ -252,17 +241,19 @@ class RetrievalService:
             try:
                 all_entities = self.vector_store.child_collection.query(
                     expr="document_id > 0",
-                    output_fields=["child_content", "parent_id"],
+                    output_fields=["document_id", "parent_id", "child_content"],
                     limit=10000,
                 )
                 self._full_bm25_docs = []
                 self._full_bm25_ids = []
+                self._full_bm25_doc_ids = []
                 for e in all_entities:
                     cc = e.get("child_content", "")
                     pid = e.get("parent_id", "")
                     if cc:
                         self._full_bm25_docs.append(cc)
                         self._full_bm25_ids.append(pid)
+                        self._full_bm25_doc_ids.append(e.get("document_id"))
                 if self._full_bm25_docs:
                     self.bm25_service.build_index(self._full_bm25_docs)
                 self._full_bm25_built = True
@@ -279,6 +270,28 @@ class RetrievalService:
                     pid = self._full_bm25_ids[doc_id]
                     score = r["score"] / max_bm25 if max_bm25 > 0 else 0
                     full_bm25_by_pid[pid] = max(full_bm25_by_pid.get(pid, 0), score)
+
+        # 1.5 对候选集 parent_content 做额外 BM25（子块中无关键词但父块中有的场景）
+        parent_bm25_by_pid = {}
+        contents_for_bm25 = []
+        pid_list_for_bm25 = []
+        for vr in vector_results:
+            pc = vr.get("content") or vr.get("parent_content") or ""
+            if pc.strip():
+                contents_for_bm25.append(pc)
+                pid_list_for_bm25.append(str(vr.get("parent_id", "")))
+        if contents_for_bm25:
+            from app.services.bm25_service import BM25Service
+            tmp_bm25 = BM25Service()
+            tmp_bm25.build_index(contents_for_bm25)
+            parent_bm25_results = tmp_bm25.search(query, top_k=min(len(contents_for_bm25), top_k * 2))
+            max_pbm25 = max((r["score"] for r in parent_bm25_results), default=1)
+            for r in parent_bm25_results:
+                doc_id = r["doc_id"]
+                if doc_id < len(pid_list_for_bm25):
+                    pid = pid_list_for_bm25[doc_id]
+                    score = r["score"] / max_pbm25 if max_pbm25 > 0 else 0
+                    parent_bm25_by_pid[pid] = max(parent_bm25_by_pid.get(pid, 0), score)
         
         # 2. 动态权重：长文本查询增加 BM25 权重
         intent_weights = {
@@ -294,22 +307,68 @@ class RetrievalService:
             bm25_weight = 0.5 if chinese_chars > 10 else 0.4
         vector_weight = 1.0 - bm25_weight
         
-        # 3. 按 parent_id 匹配 BM25 分数
+        # 3. 按 parent_id 匹配 BM25 分数（child_content + parent_content 双路 BM25）
         hybrid_results = []
         for i, vec_result in enumerate(vector_results):
             vec_score = vec_result.get("score", 0)
             pid = str(vec_result.get("parent_id", ""))
             full_bm25 = full_bm25_by_pid.get(pid, 0)
+            parent_bm25 = parent_bm25_by_pid.get(pid, 0)
+            total_bm25 = max(full_bm25, parent_bm25)
             
-            # 混合评分
-            combined_score = vector_weight * vec_score + bm25_weight * full_bm25
+             # 父块 BM25 强匹配直接大幅加分（解决关键词只在父块中的场景）
+            parent_boost = 0.0
+            if parent_bm25 > 0.3:
+                parent_boost = parent_bm25 * 0.6
+            
+            combined_score = vector_weight * vec_score + bm25_weight * total_bm25 + parent_boost
             
             hybrid_results.append({
                 **vec_result,
                 "score": round(combined_score, 4),
                 "vector_score": round(vec_score, 4),
-                "bm25_score": round(full_bm25, 4),
+                "bm25_score": round(total_bm25, 4),
             })
+
+        # 3.5 BM25 关键词兜底：逐词检索 embedding 遗漏的高匹配 chunk（至多1个）
+        import jieba
+        seen_pids = set(str(r.get("parent_id", "")) for r in hybrid_results)
+        key_terms = [w for w in jieba.cut(query) if len(w) >= 2]
+        bm25_kw_by_pid = {}
+        for kw in key_terms[:5]:
+            kw_results = self.bm25_service.search(kw, top_k=2)
+            kw_max = max((r["score"] for r in kw_results), default=1)
+            if kw_max <= 0:
+                continue
+            for r in kw_results:
+                doc_id = r["doc_id"]
+                if doc_id < len(self._full_bm25_ids):
+                    pid = str(self._full_bm25_ids[doc_id])
+                    if not pid:
+                        continue
+                    ns = r["score"] / kw_max
+                    prev = bm25_kw_by_pid.get(pid, 0)
+                    bonus = 0.25 if prev > 0 else 0
+                    bm25_kw_by_pid[pid] = min(prev + bonus + ns * 0.7, 1.5)
+        for pid, kw_score in sorted(bm25_kw_by_pid.items(), key=lambda x: x[1], reverse=True):
+            if kw_score < 0.6 or pid in seen_pids:
+                continue
+            cc, did = "", None
+            for i, p in enumerate(self._full_bm25_ids):
+                if str(p) == pid:
+                    cc = self._full_bm25_docs[i]
+                    did = self._full_bm25_doc_ids[i] if i < len(self._full_bm25_doc_ids) else None
+                    break
+            if not cc:
+                continue
+            hybrid_results.append({
+                "parent_id": pid, "document_id": did,
+                "child_content": cc, "content": "", "parent_content": "",
+                "score": round(vector_weight * 0.05 + bm25_weight * kw_score * 0.5, 4),
+                "vector_score": 0.0, "bm25_score": round(kw_score, 4),
+                "split_group_id": "",
+            })
+            break  # 至多注入1个
 
         # 4. 重排序（可关闭）
         if self.use_reranking:
@@ -418,12 +477,12 @@ class RetrievalService:
             logger.info("使用多路召回策略")
             vector_results = multi_path_retrieval.retrieve(
                 question=retrieval_query,
-                top_k=dynamic_top_k,
+                top_k=max(dynamic_top_k * 3, 20),
                 db=db,
             )
         else:
-            # 单路检索
-            candidate_k = dynamic_top_k * 2
+            # 单路检索：扩大候选池，确保低排名但含关键词的 chunk 能进入后续 BM25/重排序
+            candidate_k = max(dynamic_top_k * 4, 30)
             vector_results = self.vector_store.search(
                 query_embedding=query_embedding,
                 top_k=candidate_k,
@@ -437,27 +496,31 @@ class RetrievalService:
         #    让 Reranker 看到完整候选集，公平评估跨部分内容的相关性
         expanded_results = self._expand_split_group(vector_results, dynamic_top_k, query_embedding=query_embedding)
         if expanded_results:
-            vector_results = self._merge_and_dedup(vector_results, expanded_results, dynamic_top_k * 2)
+            vector_results = self._merge_and_dedup(vector_results, expanded_results,len(vector_results) + len(expanded_results))
+
+        # 6.5 回填 parent_content：尽早从 MySQL ParentChunk 表获取完整父块内容，
+        #     确保后续的重排序、质量过滤、最终结果构建都使用完整上下文
+        self._backfill_parent_content(vector_results, db)
 
         # 7. 混合检索（向量 + BM25 + 重排序）—— 此时候选池已包含同源文档
+        # fact 短查询给 reranker 更多候选，解决 chunk 窗口导致正确 chunk 排名靠后的问题
+        hybrid_top_k = max(dynamic_top_k, 15) if intent == "fact" else max(dynamic_top_k, 10)
         hybrid_results = self._hybrid_search(
             query=retrieval_query,
             vector_results=vector_results,
-            top_k=dynamic_top_k,
+            top_k=hybrid_top_k,
             intent=intent,
         )
 
         if not hybrid_results:
             return []
 
+        # 7.5 回填 BM25 注入 chunk 的 parent_content
+        self._backfill_parent_content(hybrid_results, db)
+
         # 8. 质量过滤
         if self.use_quality_filter:
             hybrid_results = quality_filter.filter(hybrid_results)
-            
-            # 如果过滤后结果不足，尝试扩展检索
-            if len(hybrid_results) < dynamic_top_k // 2:
-                logger.info("过滤后结果不足，触发扩展检索")
-                # 可以降低阈值重试，这里简单返回现有结果
 
         # 9. 权限过滤
         if user_role:
@@ -466,7 +529,7 @@ class RetrievalService:
                 user_role,
             )
 
-        # 9. 构建结果（补充文档元信息）
+        # 10. 构建结果（补充文档元信息）
         results = []
         doc_cache = {}
 
@@ -480,19 +543,25 @@ class RetrievalService:
             elif doc_id not in doc_cache:
                 doc_cache[doc_id] = f"文档_{doc_id}"
 
+            # 优先使用重排序后的分数，它比 RRF 归一化分数更能反映真实相关性
+            final_score = item.get("rerank_score") or item.get("score", 0)
             results.append({
-                "content": item.get("parent_content", ""),
+                "content": item.get("parent_content") or item.get("child_content", ""),
                 "child_content": item.get("child_content", ""),
                 "parent_content": item.get("parent_content", ""),
                 "source": doc_cache.get(doc_id, "未知文档"),
-                "score": item.get("score", 0),
+                "score": final_score,
                 "document_id": doc_id,
                 "vector_score": item.get("vector_score", 0),
                 "bm25_score": item.get("bm25_score", 0),
                 "split_group_id": item.get("split_group_id") or "",
             })
+        # 按 score 排序（注入的 BM25 强匹配得分可能更高）
+        results.sort(key=lambda x: x["score"], reverse=True)
+        # 截断到 top_k，防止 BM25 兜底注入撑大结果集
+        results = results[:dynamic_top_k]
 
-        # 10. 写入缓存
+        # 11. 写入缓存
         if results:
             cache_key = self._get_cache_key(question)
             cache_service.set(cache_key, results, self.cache_ttl)
@@ -500,6 +569,96 @@ class RetrievalService:
 
         logger.info(f"检索完成，返回 {len(results)} 条结果")
         return results
+
+    def _backfill_parent_content(self, results: List[Dict], db: Optional[Session]) -> None:
+        """
+        从 MySQL ParentChunk 表批量回填 parent_content
+        
+        新架构：父块内容仅存 MySQL ParentChunk 表，
+        向量检索/BM25 不再返回 parent_content，由本方法统一回填。
+        
+        Args:
+            results: 检索结果列表（原地修改）
+            db: 数据库会话
+        """
+        if not db or not results:
+            if not results:
+                return
+            logger.warning("parent_content 回填跳过: db=None（检索服务未传入数据库会话）")
+            return
+
+        # 收集需要回填的 (document_id, parent_id) 对
+        pairs = []
+        seen = set()
+        for r in results:
+            doc_id = r.get("document_id")
+            pid = r.get("parent_id")
+            if doc_id is not None and pid is not None and pid != "":
+                key = (doc_id, str(pid))
+                if key not in seen:
+                    seen.add(key)
+                    pairs.append((doc_id, str(pid)))
+
+        if not pairs:
+            logger.warning(
+                f"parent_content 回填跳过: {len(results)} 条结果均无有效的 (document_id, parent_id)"
+            )
+            return
+
+        # 批量查询 ParentChunk
+        try:
+            doc_ids = list(set(p[0] for p in pairs))
+            parent_chunks = (
+                db.query(ParentChunk)
+                .filter(ParentChunk.document_id.in_(doc_ids))
+                .all()
+            )
+
+            if not parent_chunks:
+                logger.warning(
+                    f"parent_content 回填失败: ParentChunk 表中未找到 document_id={doc_ids} 的记录。"
+                    f"请确认文档已重新上传/处理（父块内容依赖 MySQL parent_chunks 表）"
+                )
+                return
+
+            # 构建查找表: (document_id, parent_id) -> parent_content
+            pc_map = {}
+            pc_parent_ids = set()
+            for pc in parent_chunks:
+                key = (pc.document_id, str(pc.parent_id))
+                pc_map[key] = pc.parent_content or ""
+                pc_parent_ids.add(str(pc.parent_id))
+
+            # 回填每个结果
+            filled_count = 0
+            result_parent_ids = set(str(r.get("parent_id", "")) for r in results)
+
+            for r in results:
+                doc_id_val = r.get("document_id")
+                pid_val = r.get("parent_id")
+                if doc_id_val is not None and pid_val is not None:
+                    key = (doc_id_val, str(pid_val))
+                    pc = pc_map.get(key)
+                    if pc:
+                        r["parent_content"] = pc
+                        # 如果 content 字段也是空的（之前靠 child_content 凑的），也更新
+                        if not r.get("content"):
+                            r["content"] = pc
+                        filled_count += 1
+
+            if filled_count > 0:
+                logger.info(f"parent_content 回填完成: {filled_count}/{len(results)} 条")
+            else:
+                # parent_id 不匹配 —— 诊断日志
+                logger.warning(
+                    f"parent_content 回填失败: 0/{len(results)} 条匹配。"
+                    f"结果中的 parent_id: {sorted(result_parent_ids)[:10]}，"
+                    f"ParentChunk 中的 parent_id: {sorted(pc_parent_ids)[:10]}，"
+                    f"document_id: {doc_ids}。"
+                    f"请检查向量库与 MySQL 的 parent_id 格式是否一致"
+                )
+        except Exception as e:
+            logger.warning(f"parent_content 回填异常: {e}", exc_info=True)
 
     def clear_cache(self):
         """清除检索缓存"""

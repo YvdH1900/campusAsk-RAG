@@ -108,9 +108,9 @@ class QueryExpansionService:
         """
         try:
             prompt = (
-                f"请为以下校园相关问题生成 {max_expansions} 个语义相似的关键词或短语，"
-                f"用于提高搜索引擎的召回率。每个词用换行分隔，只输出词本身，不要编号或解释：\n\n"
-                f"原问题：{query}"
+                f"为以下校园问题生成{max_expansions}个语义相关的搜索关键词（逗号分隔），"
+                f"只输出关键词本身，不要任何解释：\n\n"
+                f"问题：{query}"
             )
             
             from dashscope import Generation
@@ -118,17 +118,29 @@ class QueryExpansionService:
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 result_format="message",
-                temperature=0.7,
-                max_tokens=200,
+                temperature=0.3,
+                max_tokens=100,
+                enable_search=False,
+                timeout=10,
             )
             
             if response.status_code == 200:
-                content = response.output.choices[0].message.content.strip()
-                expansions = [line.strip() for line in content.split("\n") if line.strip()]
+                content = response.output.choices[0].message.content.strip() if response.output.choices else ""
+                if not content:
+                    logger.warning(f"AI 查询扩展: 模型返回空内容 (model={model_name})")
+                    raise RuntimeError(f"AI 查询扩展返回空内容")
+                
+                # 支持逗号、换行、顿号等多种分隔符
+                import re
+                tokens = re.split(r'[，,、\n]+', content)
+                expansions = [t.strip() for t in tokens if t.strip()]
                 expansions = expansions[:max_expansions]
                 
                 if expansions:
+                    logger.debug(f"AI 查询扩展结果: {expansions}")
                     return [query] + expansions
+                else:
+                    logger.warning(f"AI 查询扩展: 解析后无有效关键词, 原始内容={content[:100]}")
             
             raise RuntimeError(f"AI 查询扩展返回空或失败: status={response.status_code}")
         except Exception as e:

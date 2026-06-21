@@ -286,6 +286,7 @@ def _split_or_merge_sections(reader, bounds: list, base: str, ext: str, dir_name
             # 需要二次拆分
             pages_in_section = s["end_page"] - s["start_page"] + 1
             avg_chars_per_page = s["chars"] / pages_in_section if pages_in_section > 0 else 1000
+            avg_chars_per_page = avg_chars_per_page or 1000  # 防止除零
             
             # 计算需要拆几份
             pages_per_split = max(1, int(TARGET_CHARS / avg_chars_per_page))
@@ -417,6 +418,7 @@ def _fallback_split(reader, file_path, original_filename, total_pages):
         total_sample_chars += len(text)
     
     avg_chars_per_page = total_sample_chars / sample_pages if sample_pages > 0 else 1000
+    avg_chars_per_page = avg_chars_per_page or 1000  # 防止除零
     
     # 目标：单文档约 8000 字符（与 TARGET_CHARS 一致）
     pages_per_doc = max(1, int(TARGET_CHARS / avg_chars_per_page))

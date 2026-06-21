@@ -36,9 +36,10 @@ router = APIRouter(prefix="/documents", tags=["文档管理"])
 UPLOAD_DIR = "uploads/documents"
 TEMP_UPLOAD_DIR = "uploads/temp_documents"
 ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".txt", ".md"}
+BANNED_EXTENSIONS = {".xlsx", ".xls", ".csv", ".xlsm", ".xltx", ".xlt"}
 
 # 大文件自动拆分阈值（字节），超过此大小的文件会被拆分为多个子文档
-LARGE_FILE_THRESHOLD = 20 * 1024 * 1024  # 20MB
+LARGE_FILE_THRESHOLD = 50 * 1024 * 1024  # 50MB
 
 # 拆分策略阈值
 MIN_CHARS = 2000      # 章节过小合并阈值
@@ -481,6 +482,11 @@ async def upload_document(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"不支持的文件类型，仅支持: {', '.join(ALLOWED_EXTENSIONS)}"
         )
+    if file_ext in BANNED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="不支持 Excel/CSV 格式，请转换为 PDF 或 Word 后上传"
+        )
     
     is_admin = current_user.role == UserRole.ADMIN
 
@@ -495,12 +501,8 @@ async def upload_document(
         # 获取文件大小
         file_size = os.path.getsize(file_path)
 
-        # 检查是否为大文件，需要拆分
+        # 大文件标记（实际拆分在 Celery 异步任务中执行，避免阻塞上传接口）
         is_large_file = file_size > LARGE_FILE_THRESHOLD
-        split_files = []
-
-        if is_large_file:
-            split_files = split_large_file(file_path, file.filename)
 
         # 无论是否拆分，MySQL 只存 1 条原始文档记录
         new_document = Document(
@@ -520,16 +522,11 @@ async def upload_document(
         db.commit()
         db.refresh(new_document)
 
-        # 使用 Celery 异步处理文档（大文件拆分在任务内部处理）
-        if split_files:
-            logger.info(f"大文件自动拆分: {file.filename} ({file_size/1024/1024:.1f}MB) -> {len(split_files)} 个文件")
-            # 保留原文件，拆分文件作为临时处理文件
-            process_document_task.apply_async(
-                args=[new_document.id],
-                kwargs={"split_files": split_files},
-            )
-        else:
-            process_document_task.delay(new_document.id)
+        # 使用 Celery 异步处理文档（大文件拆分在任务内部异步执行）
+        process_document_task.apply_async(
+            args=[new_document.id],
+            kwargs={"is_large_file": is_large_file},
+        )
 
         return new_document
     else:
@@ -657,29 +654,18 @@ def review_document(
         document.reviewed_by = current_user.id
         document.reviewed_at = datetime.utcnow()
 
-        # 检查是否为大文件，需要拆分
+        # 大文件标记（实际拆分在 Celery 异步任务中执行，避免阻塞审核接口）
         file_size = os.path.getsize(document.file_path) if os.path.exists(document.file_path) else 0
-        split_files = []
+        is_large_file = file_size > LARGE_FILE_THRESHOLD
 
-        if file_size > LARGE_FILE_THRESHOLD:
-            split_files = split_large_file(document.file_path, document.filename)
+        document.status = "processing"
+        db.commit()
 
-        if split_files:
-            logger.info(f"审核通过-大文件自动拆分: {document.filename} ({file_size/1024/1024:.1f}MB) -> {len(split_files)} 个文件")
-            # 删除原文件，拆分文件作为临时处理文件
-            os.remove(document.file_path)
-            document.status = "processing"
-            db.commit()
-            
-            # 将拆分文件列表传递给 Celery 任务
-            process_document_task.apply_async(
-                args=[document.id],
-                kwargs={"split_files": split_files},
-            )
-        else:
-            document.status = "processing"
-            db.commit()
-            process_document_task.delay(document.id)
+        # 使用 Celery 异步处理文档（大文件拆分在任务内部异步执行）
+        process_document_task.apply_async(
+            args=[document.id],
+            kwargs={"is_large_file": is_large_file},
+        )
 
         return document
                 
@@ -785,17 +771,17 @@ def delete_document(
         except Exception as e:
             logger.warning(f"删除本地文件失败: {document.file_path}, 错误: {str(e)}")
     
-    # 2. 删除向量库数据（关键操作，失败则中止）
+    # 2. 删除向量库数据和父块（关键操作，失败则中止）
     try:
         from app.services.document_processor import DocumentProcessor
         from app.services.vector_store import VectorStore
         processor = DocumentProcessor()
-        processor.delete_document_vectors(document_id)
+        processor.delete_document_vectors(document_id, db=db)
         vector_store = VectorStore()
         orphan_deleted = vector_store.delete_orphan_vectors()
         if orphan_deleted > 0:
             logger.info(f"清理了 {orphan_deleted} 条孤儿向量")
-        logger.info(f"已删除向量数据: document_id={document_id}")
+        logger.info(f"已删除向量数据和父块: document_id={document_id}")
     except Exception as e:
         logger.error(f"删除向量数据失败: document_id={document_id}, 错误: {str(e)}")
         # 即使向量删除失败，也继续删除数据库记录
@@ -867,7 +853,7 @@ def batch_delete_documents(
             try:
                 from app.services.document_processor import DocumentProcessor
                 processor = DocumentProcessor()
-                processor.delete_document_vectors(doc_id)
+                processor.delete_document_vectors(doc_id, db=db)
             except Exception as e:
                 logger.error(f"删除向量数据失败: document_id={doc_id}, 错误: {str(e)}")
             

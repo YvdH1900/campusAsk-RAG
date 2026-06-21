@@ -96,7 +96,7 @@ class TestDocumentProcessorReal:
         db.commit()
         db.refresh(doc)
 
-        with pytest.raises(ValueError, match="文档内容为空"):
+        with pytest.raises(ValueError, match="内容为空"):
             processor.process_document(doc, db)
 
         db.refresh(doc)

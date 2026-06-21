@@ -321,9 +321,11 @@ def ask_question_stream(
             print(f"[DIAG] 会话找到：gen_session.id={gen_session.id}", file=sys.stderr, flush=True)
 
             chat_history_inner = get_chat_history(gen_session.id, gen_db)
+            print(f"[DIAG] 准备调用 qa_service.ask_stream, question='{request.content[:30]}...'", file=sys.stderr, flush=True)
 
             # 委托 qa_service.ask_stream() 处理核心 RAG pipeline
             done_data = None
+            event_count = 0
             for event in qa_service.ask_stream(
                 question=request.content,
                 chat_history=chat_history_inner,
@@ -331,10 +333,14 @@ def ask_question_stream(
                 db=gen_db,
                 user_role=user_role,
             ):
+                event_count += 1
+                print(f"[DIAG] 收到事件 #{event_count}: type={event.get('type')}", file=sys.stderr, flush=True)
                 if event["type"] == "chunk":
                     yield f"data: {json.dumps({'type': 'chunk', 'content': event['content']}, ensure_ascii=False)}\n\n"
                 elif event["type"] == "done":
                     done_data = event
+            
+            print(f"[DIAG] ask_stream 完成，共收到 {event_count} 个事件", file=sys.stderr, flush=True)
             
             if not done_data:
                 done_data = {"type": "done", "answer": "", "contexts": [], "sources": [], "confidence": "低", "features": {}, "summary_text": None, "model_name": settings.LLM_MODEL}
@@ -861,7 +867,7 @@ def eval_retrieve(
     return {
         "results": [
             {
-                "content": r.get("child_content", "") or r.get("parent_content", "") or r.get("content", ""),
+                "content": r.get("parent_content") or r.get("content") or r.get("child_content", ""),
                 "child_content": r.get("child_content", ""),
                 "parent_content": r.get("parent_content", ""),
                 "source": r.get("source", ""),

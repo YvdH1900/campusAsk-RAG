@@ -142,9 +142,9 @@ class QAService:
                     incremental_output=True,
                 )
 
-                # 流式调用返回 generator，直接返回
+                # 流式调用返回 generator，状态码在迭代时才能验证
                 if stream:
-                    logger.info(f"LLM 流式调用成功: {model_name}")
+                    logger.info(f"LLM 流式调用已发起: {model_name}")
                     return response
                 
                 # 非流式调用检查状态码
@@ -212,11 +212,15 @@ class QAService:
                     parent_id = ctx.get("parent_id")
                     if parent_id and parent_id not in seen_parents:
                         seen_parents.add(parent_id)
-                        parent_contents.append(ctx.get("parent_content", ""))
+                        # parent_content 可能为空，回退到 child_content
+                        content_text = ctx.get("parent_content") or ctx.get("child_content", "")
+                        if content_text:
+                            parent_contents.append(content_text)
 
                 # 构建合并后的上下文
-                merged_content = "\n\n---\n\n".join(parent_contents)
+                merged_content = "\n\n---\n\n".join(parent_contents) if parent_contents else ""
                 merged_ctx = group_chunks[0].copy()
+                merged_ctx["content"] = merged_content
                 merged_ctx["parent_content"] = merged_content
                 merged_ctx["child_content"] = merged_content[:500]  # 保留子块内容用于展示
                 merged_ctx["_merged"] = True
@@ -257,41 +261,77 @@ class QAService:
         else:
             return "低"
 
-    def _build_fallback_answer(self, question: str, contexts: List[Dict]) -> Dict:
+    def _is_answer_cacheable(self, answer: str) -> bool:
         """
-        构建降级回答（LLM 不可用时）
+        检查答案是否值得缓存
+        
+        排除"未找到信息"类无价值回答，防止语义缓存被低质量答案污染。
         
         Args:
-            question: 用户问题
-            contexts: 检索到的上下文
+            answer: LLM 生成的回答
             
         Returns:
-            降级回答
+            是否值得缓存
+        """
+        if not answer:
+            return False
+        
+        # 不可缓存的模式：LLM 表示无法从知识库找到信息
+        not_found_patterns = [
+            "无法找到",
+            "没有找到相关",
+            "未找到相关",
+            "没有找到关于",
+            "知识库中未包含",
+            "未提及",
+            "无法基于",
+            "我无法回答",
+            "抱歉，我目前无法",
+        ]
+        for pattern in not_found_patterns:
+            if pattern in answer:
+                logger.info(f"答案包含'未找到'模式('{pattern}')，跳过缓存")
+                return False
+        
+        return True
+
+    def _build_answer_from_contexts(self, question: str, contexts: List[Dict]) -> str:
+        """从检索上下文直接构造回答（不依赖 LLM）
+
+        将多个检索结果的 content 拼接为完整回答，按得分排序，
+        每条标注来源，上限 2000 字符。
         """
         if not contexts:
-            return {
-                "answer": "抱歉，我暂时无法从校园知识库中找到相关信息。请尝试换一种提问方式，或联系管理员补充相关知识文档。",
-                "sources": [],
-                "context_count": 0,
-                "confidence": "低",
-            }
+            return "抱歉，我暂时无法从校园知识库中找到相关信息。请尝试换一种提问方式。"
 
-        # 返回最相关的上下文原文
-        top_context = contexts[0]
-        answer = (
-            f"根据知识库检索，以下信息可能与您的问题相关：\n\n"
-            f"[来源：{top_context['source']}]\n"
-            f"{top_context['content'][:500]}...\n\n"
-            f"由于系统正在处理中，以上为直接检索结果。请稍后重试以获取更完整的回答。"
-        )
+        parts = []
+        seen = set()
+        total_len = 0
+        max_len = 2000
 
-        return {
-            "answer": answer,
-            "sources": [ctx["source"] for ctx in contexts[:3]],
-            "context_count": len(contexts),
-            "confidence": "低",
-            "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-        }
+        for ctx in contexts:
+            content = (ctx.get("content") or "").strip()
+            if not content or content in seen:
+                continue
+            seen.add(content)
+
+            source = ctx.get("source", "未知来源")
+            snippet = content[:500] if len(content) > 500 else content
+
+            if total_len + len(snippet) + len(source) + 10 > max_len:
+                remaining = max_len - total_len - len(source) - 10
+                if remaining > 50:
+                    snippet = content[:remaining]
+                else:
+                    break
+
+            parts.append(f"【来源：{source}】\n{snippet}")
+            total_len += len(snippet) + len(source) + 10
+
+        if not parts:
+            return "抱歉，检索到的内容无法有效回答该问题。请尝试换一种提问方式。"
+
+        return "\n\n".join(parts)
 
     def _handle_chat_question(self, question: str) -> Dict:
         """
@@ -402,8 +442,15 @@ class QAService:
         contexts = self._merge_cross_document_context(contexts)
 
         if not contexts:
-            fallback = self._build_fallback_answer(question, [])
-            return fallback
+            return {
+                "answer": self._build_answer_from_contexts(question, []),
+                "sources": [],
+                "context_count": 0,
+                "confidence": "低",
+                "features": {},
+                "summary_text": None,
+                "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            }
 
         # 5. 智能对话历史管理
         current_model = self._get_current_model_name(db)
@@ -441,8 +488,20 @@ class QAService:
                 "total_tokens": getattr(response.usage, "total_tokens", 0),
             }
         except Exception as e:
-            logger.error(f"LLM 调用失败，使用降级策略: {str(e)}")
-            return self._build_fallback_answer(question, contexts)
+            logger.error(f"LLM 调用失败，使用检索上下文直接回答: {str(e)}")
+            feature_status = self.retriever.get_feature_status()
+            return {
+                "answer": self._build_answer_from_contexts(question, contexts),
+                "sources": [ctx["source"] for ctx in contexts],
+                "context_count": len(contexts),
+                "confidence": "低",
+                "features": {
+                    "rerank_method": feature_status.get("rerank_method", "unknown"),
+                    "reranker_model": feature_status.get("reranker_model", "未配置"),
+                },
+                "summary_text": summary_text,
+                "token_usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            }
 
         # 8. 答案验证（优先 AI 验证，失败降级规则验证）
         if self.use_answer_verification:
@@ -506,8 +565,8 @@ class QAService:
             "token_usage": token_usage,
         }
 
-        # 11. 缓存回答（高置信度）
-        if confidence == "高":
+        # 11. 缓存回答（高置信度 + 答案有效性检查）
+        if confidence == "高" and self._is_answer_cacheable(answer):
             cache_service.set(cache_key, result, self.answer_cache_ttl)
             # 同时存储到语义缓存
             semantic_cache.store(question, result, db=db)
@@ -571,7 +630,7 @@ class QAService:
         sources = list(dict.fromkeys(ctx.get("source", "未知文档") for ctx in contexts))
 
         if not contexts:
-            full_text = self._build_fallback_answer(question, [])["answer"]
+            full_text = self._build_answer_from_contexts(question, [])
             yield {"type": "chunk", "content": full_text}
             yield self._build_stream_done(full_text, [], [], current_model, None, {})
             return
@@ -608,17 +667,49 @@ class QAService:
             full_answer_chunks = []
             last_chunk = None
             for chunk in response:
+                # 检测流式 API 错误（HTTP 4xx/5xx 等非 200 状态码）
+                if hasattr(chunk, 'status_code') and chunk.status_code != 200:
+                    error_code = getattr(chunk, 'code', '')
+                    error_message = getattr(chunk, 'message', '')
+                    request_id = getattr(chunk, 'request_id', '')
+                    raise RuntimeError(
+                        f"LLM API 错误 (HTTP {chunk.status_code})"
+                        f"{': ' + error_code if error_code else ''}"
+                        f"{': ' + error_message if error_message else ''}"
+                        f"{' [request_id=' + request_id + ']' if request_id else ''}"
+                    )
+                
                 if not hasattr(chunk, 'output') or chunk.output is None:
                     continue
+                
+                # 兼容 text 格式（output.text）和 message 格式（output.choices）
+                if hasattr(chunk.output, 'text') and chunk.output.text:
+                    content = chunk.output.text
+                    chunk_count += 1
+                    full_answer_chunks.append(content)
+                    yield {"type": "chunk", "content": content}
+                    last_chunk = chunk
+                    continue
+                
                 if not hasattr(chunk.output, 'choices') or not chunk.output.choices:
                     continue
                 
                 try:
-                    message = chunk.output.choices[0].message
-                    if not message or not hasattr(message, 'content'):
+                    choice = chunk.output.choices[0]
+                    # 兼容 delta 格式（新版 DashScope API）和 message 格式（旧版）
+                    msg_or_delta = choice.message if hasattr(choice, 'message') and choice.message else None
+                    if msg_or_delta is None:
+                        msg_or_delta = choice.get("delta") if hasattr(choice, 'get') else None
+                    
+                    if not msg_or_delta:
                         continue
                     
-                    content = message.content
+                    content = None
+                    if hasattr(msg_or_delta, 'content'):
+                        content = msg_or_delta.content
+                    elif isinstance(msg_or_delta, dict):
+                        content = msg_or_delta.get("content")
+                    
                     if content:
                         chunk_count += 1
                         full_answer_chunks.append(content)
@@ -630,6 +721,13 @@ class QAService:
                     continue
             
             full_text = "".join(full_answer_chunks)
+            
+            # LLM 返回了流式响应但无实质内容，按 API 异常处理
+            if not full_text.strip():
+                raise RuntimeError(
+                    f"LLM 流式响应无内容: 共收到 {chunk_count} 个有效 chunk，"
+                    f"但均无文本内容 (chunk_count={chunk_count}, total_chunks=unknown)"
+                )
             
             # 从最后一个 chunk 提取 token 使用量
             if last_chunk and hasattr(last_chunk, 'usage') and last_chunk.usage is not None:
@@ -660,8 +758,9 @@ class QAService:
             
             logger.info(f"流式 LLM 调用完成: {current_model}, 共 {chunk_count} 个 chunk, token: {token_usage.get('total_tokens', 0)}")
         except Exception as e:
-            logger.error(f"流式 LLM 调用失败，使用降级策略: {str(e)}")
-            full_text = self._build_fallback_answer(question, contexts)["answer"]
+            logger.error(f"LLM 调用失败，使用检索上下文直接回答: {str(e)}")
+            full_text = self._build_answer_from_contexts(question, contexts)
+            token_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
             yield {"type": "chunk", "content": full_text}
 
         # 6. yield 元数据供调用方后处理

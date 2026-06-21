@@ -81,24 +81,14 @@ class TestQABasic:
             "strategy": {"direct_answer": False}
         }), \
              patch.object(service.retriever, 'retrieve', return_value=[]), \
-             patch.object(service, '_build_fallback_answer', return_value={
-                 "answer": "抱歉，没有找到相关信息。",
-                 "sources": [],
-                 "context_count": 0,
-                 "confidence": "低"
-             }):
+             patch.object(service, '_build_answer_from_contexts', return_value="抱歉，没有找到相关信息。"):
             result = service.ask("", chat_history=[])
             assert isinstance(result, dict)
 
     def test_ask_no_context(self, service, sample_question):
         """测试无上下文"""
         with patch.object(service.retriever, 'retrieve', return_value=[]), \
-             patch.object(service, '_build_fallback_answer', return_value={
-                 "answer": "抱歉，没有找到相关信息。",
-                 "sources": [],
-                 "context_count": 0,
-                 "confidence": "低"
-             }):
+             patch.object(service, '_build_answer_from_contexts', return_value="抱歉，没有找到相关信息。"):
             result = service.ask(sample_question, chat_history=[])
             assert isinstance(result, dict)
 
@@ -330,12 +320,7 @@ class TestIntentClassification:
             "strategy": {"direct_answer": False}
         }), \
              patch.object(service.retriever, 'retrieve', return_value=[]), \
-             patch.object(service, '_build_fallback_answer', return_value={
-                 "answer": "回答",
-                 "sources": [],
-                 "context_count": 0,
-                 "confidence": "低"
-             }):
+             patch.object(service, '_build_answer_from_contexts', return_value="回答"):
             result = service.ask("奖学金怎么申请？", chat_history=[])
             assert isinstance(result, dict)
 

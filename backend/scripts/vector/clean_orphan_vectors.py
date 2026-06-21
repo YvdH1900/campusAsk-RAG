@@ -64,13 +64,15 @@ def main():
         
         # 创建新集合
         print(f"\n创建新集合 '{collection_name}'...")
+        MAX_VARCHAR_LENGTH = 65535
         fields = [
             FieldSchema(name="id", dtype=DataType.VARCHAR, max_length=100, is_primary=True),
             FieldSchema(name="document_id", dtype=DataType.INT64, description="文档ID"),
             FieldSchema(name="parent_id", dtype=DataType.VARCHAR, max_length=100, description="父块ID"),
             FieldSchema(name="child_id", dtype=DataType.VARCHAR, max_length=100, description="子块ID"),
-            FieldSchema(name="parent_content", dtype=DataType.VARCHAR, max_length=4000, description="父块内容（完整上下文）"),
-            FieldSchema(name="child_content", dtype=DataType.VARCHAR, max_length=2000, description="子块内容（用于检索匹配）"),
+            FieldSchema(name="parent_content", dtype=DataType.VARCHAR, max_length=MAX_VARCHAR_LENGTH, description="父块内容（已迁移到 MySQL，此字段保留兼容）"),
+            FieldSchema(name="child_content", dtype=DataType.VARCHAR, max_length=MAX_VARCHAR_LENGTH, description="子块内容（用于检索匹配）"),
+            FieldSchema(name="split_group_id", dtype=DataType.VARCHAR, max_length=200, description="拆分组ID"),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dimension, description="子块向量"),
         ]
 

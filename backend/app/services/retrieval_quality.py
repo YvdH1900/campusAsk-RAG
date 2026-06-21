@@ -79,9 +79,10 @@ class RetrievalQualityFilter:
             )
             return final_results
 
-        # 极端情况：所有结果都被过滤，返回空
-        logger.warning(f"所有结果被过滤，返回空结果")
-        return []
+        # 极端情况：所有结果都被过滤，返回 top-N 兜底
+        _score = results[0].get("rerank_score", results[0].get("score", 0))
+        logger.warning(f"所有结果被过滤（最高分={_score:.4f}），返回 top-{self.MIN_RESULTS_COUNT} 兜底")
+        return results[:self.MIN_RESULTS_COUNT]
 
     def _filter_with_fixed_threshold(
         self,
@@ -94,12 +95,14 @@ class RetrievalQualityFilter:
         
         for result in results:
             # 1. 相似度过滤
-            score = result.get("rerank_score") or result.get("score", 0)
+            score = result.get("rerank_score")
+            if score is None:
+                score = result.get("score", 0)
             if score < threshold:
                 continue
             
-            # 2. 内容长度过滤（兼容 content 和 parent_content 字段）
-            content = result.get("content") or result.get("parent_content", "")
+            # 2. 内容长度过滤（兼容 content / parent_content / child_content 字段）
+            content = result.get("content") or result.get("parent_content") or result.get("child_content", "")
             if len(content) < min_length:
                 continue
             
@@ -127,8 +130,8 @@ class RetrievalQualityFilter:
         seen_contents = []
         
         for result in results:
-            # 兼容 content 和 parent_content 字段
-            content = result.get("content") or result.get("parent_content", "")
+            # 兼容 content / parent_content / child_content 字段
+            content = result.get("content") or result.get("parent_content") or result.get("child_content", "")
             is_duplicate = False
             
             for seen_content in seen_contents:

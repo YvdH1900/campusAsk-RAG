@@ -189,25 +189,16 @@ class VectorStore:
                 need_rebuild = True
                 rebuild_reason = "缺少 split_group_id 字段"
             
-            # 检查字段长度是否匹配（设置为 65535 后不再需要检查）
-            # 如果旧集合字段长度 < 65535，则重建
-            for field in schema.fields:
-                if field.name in ("parent_content", "child_content"):
-                    existing_max_length = field.params.get("max_length")
-                    if existing_max_length and existing_max_length < 65535:
-                        need_rebuild = True
-                        rebuild_reason = f"字段长度不足: {field.name} 现有={existing_max_length}, 需要 65535"
-                        break
+            # 检查字段长度是否匹配（设置为 65535 后不再需要检查，child_content 也已设为最大值）
             
             if need_rebuild:
                 logger.warning(
                     f"集合需要重建: {rebuild_reason}，"
                     f"自动重建集合（旧数据将被清除，需重新处理文档）"
                 )
-                utility.drop_collection(self._collection_name)
-                self._create_child_collection()
-                self.child_collection = Collection(self._collection_name)
-                self.child_collection.load()
+                print(f"[DIAG-VEC] 自动重建集合!!! 原因: {rebuild_reason}", flush=True)
+                print(f"[DIAG-VEC] 警告: 所有旧向量将被删除，需重新上传文档!", flush=True)
+                self._rebuild_collection()
                 return
         
         if not utility.has_collection(self._collection_name):
@@ -215,6 +206,20 @@ class VectorStore:
         
         self.child_collection = Collection(self._collection_name)
         self.child_collection.load()
+
+    def _rebuild_collection(self):
+        """重建集合（删除旧集合并创建新集合）"""
+        logger.warning(f"正在重建集合 {self._collection_name}...")
+        try:
+            if utility.has_collection(self._collection_name):
+                utility.drop_collection(self._collection_name)
+            self._create_child_collection()
+            self.child_collection = Collection(self._collection_name)
+            self.child_collection.load()
+            logger.info(f"集合 {self._collection_name} 重建完成")
+        except Exception as e:
+            logger.error(f"集合重建失败: {e}")
+            raise
 
     def _reconnect(self):
         """重新连接 Milvus"""
@@ -236,7 +241,7 @@ class VectorStore:
             FieldSchema(name="document_id", dtype=DataType.INT64, description="文档ID"),
             FieldSchema(name="parent_id", dtype=DataType.VARCHAR, max_length=100, description="父块ID"),
             FieldSchema(name="child_id", dtype=DataType.VARCHAR, max_length=100, description="子块ID"),
-            FieldSchema(name="parent_content", dtype=DataType.VARCHAR, max_length=MAX_VARCHAR_LENGTH, description="父块内容（完整上下文）"),
+            FieldSchema(name="parent_content", dtype=DataType.VARCHAR, max_length=MAX_VARCHAR_LENGTH, description="父块内容（已迁移到 MySQL，此字段不再写入/查询，仅保留兼容旧 schema）"),
             FieldSchema(name="child_content", dtype=DataType.VARCHAR, max_length=MAX_VARCHAR_LENGTH, description="子块内容（用于检索匹配）"),
             FieldSchema(name="split_group_id", dtype=DataType.VARCHAR, max_length=200, description="拆分组ID（同源子文档共享）"),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=self._dimension, description="子块向量"),
@@ -278,7 +283,7 @@ class VectorStore:
         split_group_id: Optional[str] = None,
     ) -> List[str]:
         """
-        插入子块向量（父块内容内联存储，检索时去重）
+        插入子块向量（子块内容存入向量库，父块内容存 MySQL，检索时按 parent_id 去重）
         
         Args:
             document_id: 文档ID
@@ -331,14 +336,29 @@ class VectorStore:
             child_data[1].append(document_id)
             child_data[2].append(chunk["parent_id"])
             child_data[3].append(chunk["child_id"])
-            child_data[4].append(chunk["parent_content"][:8000])
+            child_data[4].append("")  # parent_content 字段保留但不再写入（父块内容存 MySQL parent_chunks 表）
             child_data[5].append(chunk["child_content"][:4000])
             child_data[6].append(split_group_id or "")
             child_data[7].append(embedding)
 
         if child_data[0]:
-            self.child_collection.insert(child_data)
-            self.child_collection.flush()
+            try:
+                self.child_collection.insert(child_data)
+                self.child_collection.flush()
+            except MilvusException as e:
+                error_msg = str(e)
+                # 检测 schema 不匹配（字段数量不一致）
+                if "expect" in error_msg and "list" in error_msg and "got" in error_msg:
+                    logger.warning(
+                        f"检测到集合 schema 不匹配，自动重建集合: {error_msg}"
+                    )
+                    self._rebuild_collection()
+                    # 重建后重试插入
+                    self.child_collection.insert(child_data)
+                    self.child_collection.flush()
+                    logger.info(f"集合重建后插入成功: document_id={document_id}")
+                else:
+                    raise
 
         return child_ids
 
@@ -349,7 +369,7 @@ class VectorStore:
         document_id: Optional[int] = None,
     ) -> List[Dict]:
         """
-        向量检索（子块匹配，返回父块内容并去重）
+        向量检索（子块匹配，返回子块内容 + parent_id，父块内容由 _backfill_parent_content 回填）
         
         Args:
             query_embedding: 查询向量
@@ -378,7 +398,7 @@ class VectorStore:
             param=search_params,
             limit=top_k,
             expr=expr,
-            output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content", "split_group_id"],
+            output_fields=["document_id", "parent_id", "child_id", "child_content", "split_group_id"],
         )
 
         output = []
@@ -397,7 +417,7 @@ class VectorStore:
                     "document_id": hit.entity.get("document_id"),
                     "parent_id": parent_id,
                     "child_id": hit.entity.get("child_id"),
-                    "parent_content": hit.entity.get("parent_content"),
+                    "parent_content": "",  # 父块内容存 MySQL ParentChunk 表，由 retrieval_service._backfill_parent_content() 回填
                     "child_content": hit.entity.get("child_content"),
                     "split_group_id": hit.entity.get("split_group_id") or "",
                     "score": hit.distance,
@@ -453,7 +473,7 @@ class VectorStore:
                 param=search_params,
                 limit=top_k,
                 expr=base_expr,
-                output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content", "split_group_id"],
+                output_fields=["document_id", "parent_id", "child_id", "child_content", "split_group_id"],
             )
             
             output = []
@@ -470,7 +490,7 @@ class VectorStore:
                         "document_id": hit.entity.get("document_id"),
                         "parent_id": parent_id,
                         "child_id": hit.entity.get("child_id"),
-                        "parent_content": hit.entity.get("parent_content"),
+                        "parent_content": "",  # 父块内容存 MySQL ParentChunk 表
                         "child_content": hit.entity.get("child_content"),
                         "split_group_id": hit.entity.get("split_group_id") or "",
                         "score": hit.distance,
@@ -481,7 +501,7 @@ class VectorStore:
         # 无查询向量时，简单查询返回（用于兜底）
         results = self.child_collection.query(
             expr=base_expr,
-            output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content", "split_group_id"],
+            output_fields=["document_id", "parent_id", "child_id", "child_content", "split_group_id"],
             limit=1000,
         )
         
@@ -501,7 +521,7 @@ class VectorStore:
                 "document_id": item.get("document_id"),
                 "parent_id": parent_id,
                 "child_id": item.get("child_id"),
-                "parent_content": item.get("parent_content"),
+                "parent_content": "",  # 父块内容存 MySQL ParentChunk 表
                 "child_content": item.get("child_content"),
                 "split_group_id": item.get("split_group_id") or "",
                 "score": 0.0,

@@ -75,6 +75,9 @@ async def lifespan(app: FastAPI):
     
     _sync_model_config_from_db()
     
+    # 启动时检查关键依赖（PDF 解析、OCR 等）
+    _check_critical_dependencies()
+    
     logger.info("✅ 系统初始化完成")
     
     yield
@@ -228,6 +231,26 @@ def _sync_model_config_from_db():
             db.close()
     except Exception as e:
         logger.warning(f"从数据库加载模型配置失败: {e}，使用配置文件默认值")
+
+
+def _check_critical_dependencies():
+    """
+    启动时检查关键依赖，缺失的自动安装
+    """
+    try:
+        from app.utils.dependency_checker import check_and_install_deps
+        result = check_and_install_deps()
+        
+        installed = result.get("installed", [])
+        failed = result.get("failed", [])
+        
+        if installed:
+            logger.info(f"✅ 已安装依赖: {', '.join(installed)}")
+        if failed:
+            logger.warning(f"⚠️ 以下依赖安装失败，相关功能将受限: {', '.join(failed)}")
+            logger.warning("💡 提示：扫描版 PDF 的 OCR 功能需要 PaddleOCR，缺少不影响普通 PDF/Word 处理")
+    except Exception as e:
+        logger.warning(f"依赖检查过程出错: {e}")
 
 
 app = FastAPI(

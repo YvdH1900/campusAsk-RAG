@@ -110,7 +110,7 @@ class MultiPathRetrieval:
             # 从向量库查询所有子块内容
             all_entities = self.vector_store.child_collection.query(
                 expr="document_id > 0",
-                output_fields=["document_id", "parent_id", "child_id", "parent_content", "child_content", "split_group_id"],
+                output_fields=["document_id", "parent_id", "child_id", "child_content", "split_group_id"],
                 limit=10000,
             )
             
@@ -129,7 +129,7 @@ class MultiPathRetrieval:
                         "document_id": entity.get("document_id"),
                         "parent_id": entity.get("parent_id"),
                         "child_id": entity.get("child_id"),
-                        "parent_content": entity.get("parent_content", ""),
+                        "parent_content": "",  # 父块内容存 MySQL ParentChunk 表，由 _backfill_parent_content() 回填
                         "child_content": content,
                         "split_group_id": entity.get("split_group_id") or "",
                     })

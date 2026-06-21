@@ -199,6 +199,26 @@ class ModelConfig(Base):
     updated_at = Column(DateTime, default=get_beijing_time, onupdate=get_beijing_time, nullable=False, comment="更新时间")
 
 
+class ParentChunk(Base):
+    """
+    父块存储模型
+    存储文档的父块内容（章节级上下文），子块向量仍存 Milvus
+    
+    检索时：子块在 Milvus 中匹配 → 通过 parent_id 回查此表获取完整父块内容
+    """
+    __tablename__ = "parent_chunks"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False, index=True, comment="文档ID")
+    parent_id = Column(String(100), nullable=False, index=True, comment="父块ID（如 p0, p1）")
+    parent_content = Column(Text, nullable=False, comment="父块完整内容")
+    split_group_id = Column(String(100), nullable=True, index=True, comment="拆分组ID")
+    created_at = Column(DateTime, default=get_beijing_time, nullable=False, comment="创建时间")
+    updated_at = Column(DateTime, default=get_beijing_time, onupdate=get_beijing_time, nullable=False, comment="更新时间")
+
+    document = relationship("Document", backref="parent_chunks")
+
+
 class QuestionStat(Base):
     """
     问题统计模型
