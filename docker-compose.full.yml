@@ -80,14 +80,18 @@ services:
     container_name: campusask-backend
     ports:
       - "8000:8000"
-    env_file:
-      - ./backend/.env
     environment:
       - DATABASE_URL=mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-root}@mysql:3306/campus_ask_rag?charset=utf8mb4
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672//
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - MILVUS_HOST=milvus
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-qwen-plus}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-v4}
+      - SECRET_KEY=${SECRET_KEY}
+      - ENABLE_API_DOCS=${ENABLE_API_DOCS:-false}
+      - DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD:-}
       - ALLOWED_ORIGINS='["*"]'
     volumes:
       - ./backend/logs:/app/logs
@@ -112,13 +116,16 @@ services:
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
     container_name: campusask-celery
     command: celery -A app.core.celery:celery_app worker --loglevel=info
-    env_file:
-      - ./backend/.env
     environment:
       - DATABASE_URL=mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-root}@mysql:3306/campus_ask_rag?charset=utf8mb4
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672//
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - MILVUS_HOST=milvus
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-qwen-plus}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-text-embedding-v4}
+      - SECRET_KEY=${SECRET_KEY}
     depends_on:
       - rabbitmq
       - redis
